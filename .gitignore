@@ -1,0 +1,19 @@
+# Build output
+Debug/
+Release/
+*.o
+*.d
+*.su
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+
+# Eclipse / STM32CubeIDE workspace state
+.settings/
+.metadata/
+
+# Python
+__pycache__/
+*.pyc
