@@ -11,6 +11,7 @@ shutter with review, self-timer, battery and SD status icons.
 - Touch: XPT2046 on the same SPI bus, calibration stored in flash
 
 **Wiring, power, flashing and LED codes:** see [docs/WIRING.md](docs/WIRING.md).
+**Current status and next steps:** see [docs/STATUS.md](docs/STATUS.md).
 
 ## Layout
 
