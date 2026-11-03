@@ -115,6 +115,43 @@ bool Camera_LastFrameHadOverrun(void);
 Camera_Status_t Camera_DumpFrameUart(UART_HandleTypeDef *huart);
 
 /**
+  * @brief  Start live preview: continuous capture, alternating between the
+  *         two frame buffers.  Poll Camera_LiveAcquire() for new frames.
+  * @note   Snapshot capture (Camera_Capture) must not be used while live;
+  *         call Camera_StopLive() first.
+  */
+Camera_Status_t Camera_StartLive(void);
+
+/** Stop live preview and leave the DCMI idle. */
+void Camera_StopLive(void);
+
+/**
+  * @brief  Claim the newest complete frame for display.
+  * @retval Buffer index (0/1) - pass to Camera_GetFrameBuffer() - or -1 if
+  *         no new frame has arrived since the last call.  The camera will
+  *         not write into a claimed buffer until Camera_LiveRelease().
+  */
+int32_t Camera_LiveAcquire(void);
+
+/** Hand the claimed buffer back once the display has finished with it. */
+void Camera_LiveRelease(void);
+
+/** Frame buffer by index (0/1), OV5640_FRAME_SIZE_BYTES long, writable. */
+uint8_t *Camera_GetFrameBuffer(uint32_t index);
+
+/** Complete frames captured in live mode since Camera_StartLive(). */
+uint32_t Camera_GetLiveFrameCount(void);
+
+/** Frames that ended short (partial first frame, or lost data). */
+uint32_t Camera_GetLiveShortCount(void);
+
+/** Frames overwritten because the display was still busy with the other. */
+uint32_t Camera_GetLiveDroppedCount(void);
+
+/** DCMI interrupt entry point, called from stm32f7xx_it.c. */
+void Camera_DcmiIrqHandler(void);
+
+/**
   * @brief  Initialise DMA2 Stream1 and link it to the DCMI handle.
   * @note   Called from HAL_DCMI_MspInit(); not intended for application use.
   */

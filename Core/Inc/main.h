@@ -57,6 +57,20 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define LCD_RST_Pin GPIO_PIN_12
+#define LCD_RST_GPIO_Port GPIOF
+#define T_CS_Pin GPIO_PIN_13
+#define T_CS_GPIO_Port GPIOF
+#define SHUTTER_Pin GPIO_PIN_14
+#define SHUTTER_GPIO_Port GPIOF
+#define SHUTTER_EXTI_IRQn EXTI15_10_IRQn
+#define T_IRQ_Pin GPIO_PIN_11
+#define T_IRQ_GPIO_Port GPIOE
+#define T_IRQ_EXTI_IRQn EXTI15_10_IRQn
+#define LCD_CS_Pin GPIO_PIN_14
+#define LCD_CS_GPIO_Port GPIOD
+#define LCD_DC_Pin GPIO_PIN_15
+#define LCD_DC_GPIO_Port GPIOD
 
 /* USER CODE BEGIN Private defines */
 

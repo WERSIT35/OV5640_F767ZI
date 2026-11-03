@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "camera.h"
+#include "lcd.h"
 #include "ov5640.h"
 #include <stdio.h>
 #include <stdarg.h>
@@ -53,9 +54,39 @@ DCMI_HandleTypeDef hdcmi;
 
 I2C_HandleTypeDef hi2c2;
 
+SPI_HandleTypeDef hspi1;
+
 UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
+
+/*
+ * Live-preview statistics, refreshed once per second.  Also printed on the
+ * UART, but kept in RAM so they can be read over SWD (STM32CubeProgrammer
+ * or a debugger watch) with no serial link at all.
+ */
+typedef struct
+{
+  uint32_t camera_fps;        /* complete frames from the DCMI, per second  */
+  uint32_t display_fps;       /* frames sent to the LCD, per second         */
+  uint32_t overruns;          /* DCMI FIFO overruns since reset             */
+  uint32_t short_frames;      /* frames that ended early                    */
+  uint32_t dropped;           /* frames lost because the LCD was still busy */
+  uint32_t fill_fps_x10;      /* full-screen fill rate at boot, x10         */
+  uint32_t spi_hz;            /* LCD SPI clock                              */
+} Preview_Stats_t;
+
+volatile Preview_Stats_t preview_stats;
+
+/*
+ * PCLK tuning hook.  Write a sensor PLL system divider (1..15) here over SWD
+ * - e.g. STM32_Programmer_CLI -c port=SWD mode=HOTPLUG -w32 <addr> 4 - and
+ * the main loop applies it to register 0x3035 between frames, so frame rate
+ * against overruns can be explored without reflashing.  0 = no request.
+ * The value that wins goes into OV5640_PLL_SYSDIV in ov5640_conf.h.
+ */
+volatile uint32_t pclk_sysdiv_request;
+volatile uint32_t pclk_sysdiv_active = OV5640_PLL_SYSDIV;
 
 /* USER CODE END PV */
 
@@ -66,6 +97,7 @@ static void MX_GPIO_Init(void);
 static void MX_DCMI_Init(void);
 static void MX_I2C2_Init(void);
 static void MX_USART3_UART_Init(void);
+static void MX_SPI1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -90,7 +122,7 @@ static void MX_USART3_UART_Init(void);
  * during normal running means something is wrong rather than nothing.
  *
  * After that the two LEDs have distinct jobs:
- *   green toggling   -> a frame was captured (heartbeat, one per frame)
+ *   green toggling   -> live preview running (heartbeat, once a second)
  *   red blink codes  -> failure, flash count = Camera_Status_t value
  *   both alternating -> Error_Handler (an unexpected HAL failure)
  * ========================================================================== */
@@ -349,6 +381,106 @@ static void Diag_I2cScan(void)
 
 #endif /* CAMERA_DIAG_VERBOSE */
 
+/**
+  * @brief  Turn on the I- and D-cache, keeping the frame buffers uncached.
+  * @note   MPU region 1 covers 0x20000000-0x2007FFFF as normal, non-cacheable
+  *         memory, with its first two 64K subregions disabled so the DTCM
+  *         (0x20000000-0x2001FFFF) keeps the default map - the DTCM is never
+  *         cached anyway.  What is left is SRAM1+SRAM2, which the linker
+  *         script reserves for .framebuf.
+  *
+  *         Chosen over cache maintenance (invalidate after DCMI, clean before
+  *         SPI DMA) because the CPU never reads or writes pixels on the live
+  *         path: caching the buffers would buy nothing, and every missed or
+  *         mis-sized maintenance call would show up as stale stripes.
+  *         Everything else - code in flash, variables and stack in DTCM -
+  *         gets the full benefit of the caches.
+  *
+  *         Region 0 is CubeMX's background region (MPU_Config); region 1 has
+  *         the higher number, so it wins where they overlap.
+  */
+static void Cache_Config(void)
+{
+  MPU_Region_InitTypeDef region = {0};
+
+  HAL_MPU_Disable();
+
+  region.Enable           = MPU_REGION_ENABLE;
+  region.Number           = MPU_REGION_NUMBER1;
+  region.BaseAddress      = 0x20000000U;
+  region.Size             = MPU_REGION_SIZE_512KB;
+  region.SubRegionDisable = 0x03U;
+  region.TypeExtField     = MPU_TEX_LEVEL1;
+  region.AccessPermission = MPU_REGION_FULL_ACCESS;
+  region.DisableExec      = MPU_INSTRUCTION_ACCESS_DISABLE;
+  region.IsShareable      = MPU_ACCESS_NOT_SHAREABLE;
+  region.IsCacheable      = MPU_ACCESS_NOT_CACHEABLE;
+  region.IsBufferable     = MPU_ACCESS_NOT_BUFFERABLE;
+  HAL_MPU_ConfigRegion(&region);
+
+  HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
+
+  SCB_EnableICache();
+  SCB_EnableDCache();
+}
+
+/**
+  * @brief  Display bring-up: solid red, green, blue, then a gradient, then a
+  *         timed run of full-screen fills to measure the raw SPI frame rate.
+  * @note   Runs once at boot, before live preview, so blocking is fine here.
+  */
+static void Lcd_SelfTest(void)
+{
+  static const uint16_t solid[] = { LCD_RED, LCD_GREEN, LCD_BLUE };
+  uint16_t *pixels = (uint16_t *)Camera_GetFrameBuffer(0U);
+  uint32_t  start;
+  uint32_t  elapsed;
+  const uint32_t fills = 30U;
+
+  for (uint32_t i = 0U; i < 3U; i++)
+  {
+    Lcd_FillAsync(solid[i]);
+    Lcd_WaitIdle();
+    HAL_Delay(400U);
+  }
+
+  /* Red rises left to right, green top to bottom, blue falls left to right:
+   * every channel and both axes are visible at a glance. */
+  for (uint32_t y = 0U; y < LCD_HEIGHT; y++)
+  {
+    for (uint32_t x = 0U; x < LCD_WIDTH; x++)
+    {
+      uint32_t r = (x * 31U) / (LCD_WIDTH - 1U);
+      uint32_t g = (y * 63U) / (LCD_HEIGHT - 1U);
+      uint32_t b = 31U - r;
+
+      pixels[y * LCD_WIDTH + x] = (uint16_t)((r << 11) | (g << 5) | b);
+    }
+  }
+
+  Lcd_BlitAsync(pixels);
+  Lcd_WaitIdle();
+  HAL_Delay(800U);
+
+  start = HAL_GetTick();
+
+  for (uint32_t i = 0U; i < fills; i++)
+  {
+    Lcd_FillAsync((i & 1U) ? LCD_WHITE : LCD_BLACK);
+  }
+
+  Lcd_WaitIdle();
+  elapsed = HAL_GetTick() - start;
+
+  preview_stats.spi_hz       = Lcd_GetSpiHz();
+  preview_stats.fill_fps_x10 = (elapsed > 0U) ? (fills * 10000U) / elapsed : 0U;
+
+  Log("LCD: SPI %lu Hz, full-screen fills %lu.%lu fps\r\n",
+      (unsigned long)preview_stats.spi_hz,
+      (unsigned long)(preview_stats.fill_fps_x10 / 10U),
+      (unsigned long)(preview_stats.fill_fps_x10 % 10U));
+}
+
 static const char *Camera_StatusName(Camera_Status_t status)
 {
   switch (status)
@@ -363,6 +495,68 @@ static const char *Camera_StatusName(Camera_Status_t status)
     case CAMERA_ERR_SYNC:      return "SYNC";
     case CAMERA_ERR_PARTIAL:   return "PARTIAL (armed mid-frame)";
     default:                   return "?";
+  }
+}
+
+/**
+  * @brief  UART debug mode: take one snapshot and dump it in the framed
+  *         format Tools/recv_frame.py and Tools/live_view.py expect.
+  * @note   Live preview must be stopped first; the snapshot lands in frame
+  *         buffer 0 and is also shown on the LCD.  Frames go out only when
+  *         the host asks with 'c', so the port stays readable text the rest
+  *         of the time instead of a binary stream to dig the log out of.
+  */
+static void Debug_SnapshotToUart(void)
+{
+  Camera_Status_t status;
+
+  Log("capture...\r\n");
+
+  status = Camera_Capture(3000U);
+
+  Log("  -> %s after %lu attempt(s), %lu/%lu words left\r\n",
+      Camera_StatusName(status),
+      (unsigned long)Camera_GetLastAttempts(),
+      (unsigned long)Camera_GetTimeoutRemainingWords(),
+      (unsigned long)Camera_GetExpectedWords());
+
+  if (status == CAMERA_OK)
+  {
+    if (Camera_LastFrameHadOverrun())
+    {
+      Log("frame ok but overran (%lu total) - may show a tear; "
+          "raise OV5640_PLL_SYSDIV\r\n",
+          (unsigned long)Camera_GetOverrunCount());
+    }
+
+    Lcd_BlitAsync((const uint16_t *)Camera_GetBuffer());
+    Camera_DumpFrameUart(&huart3);
+    Lcd_WaitIdle();
+  }
+  else
+  {
+    uint32_t cr, sr, risr, misr, frames, vsyncs;
+
+    Log("capture failed: %s (overruns %lu, DMA %lu/%lu words left)\r\n",
+        Camera_StatusName(status),
+        (unsigned long)Camera_GetOverrunCount(),
+        (unsigned long)Camera_GetTimeoutRemainingWords(),
+        (unsigned long)Camera_GetExpectedWords());
+
+    Camera_GetDebugRegs(&cr, &sr, &risr, &misr, &frames, &vsyncs);
+    Log("  DCMI CR=%08lX SR=%08lX RISR=%08lX MISR=%08lX\r\n",
+        (unsigned long)cr, (unsigned long)sr,
+        (unsigned long)risr, (unsigned long)misr);
+    Log("  IRQ counts: frame=%lu vsync=%lu, attempts=%lu\r\n",
+        (unsigned long)frames, (unsigned long)vsyncs,
+        (unsigned long)Camera_GetLastAttempts());
+
+    /* One red pulse per failure. The full blink code is reserved for
+     * Camera_Init, where there is no working UART to fall back on - here
+     * the log line above says far more, far faster. */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
+    HAL_Delay(60U);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
   }
 }
 
@@ -388,7 +582,7 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-
+  Cache_Config();
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -406,6 +600,7 @@ int main(void)
   MX_DCMI_Init();
   MX_I2C2_Init();
   MX_USART3_UART_Init();
+  MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
   /* Marker 2: every MX_*_Init returned. Red latches on. */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
@@ -469,8 +664,23 @@ int main(void)
       (unsigned long)Camera_GetBufferSize());
   Log("send 'c' to receive one frame\r\n");
 
+  Lcd_Init();
+  Lcd_SelfTest();
+
+  {
+    Camera_Status_t status = Camera_StartLive();
+
+    if (status != CAMERA_OK)
+    {
+      Log("Camera_StartLive failed: %s\r\n", Camera_StatusName(status));
+      Diag_BlinkCodeForever((uint32_t)status);
+    }
+  }
+
+  Log("live preview running\r\n");
+
   /* Bring-up is over, so drop the init marker.  From here the LEDs report
-   * running state: green toggles per captured frame, red means trouble. */
+   * running state: green toggles once a second, red means trouble. */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
   /* USER CODE END 2 */
 
@@ -482,87 +692,105 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     /*
-     * Frames go out only when the host asks for one, by sending 'c'.
-     *
-     * Streaming them continuously made the UART useless for anything else:
-     * the log text was buried in pixel data, and the receiver had to search
-     * for the frame header inside a binary stream where the four-byte magic
-     * collides constantly with ordinary pixel values.  On demand, the port
-     * is readable text right up until the moment a frame is requested.
+     * Live preview.  Nothing here blocks: each pass checks the UART for a
+     * debug request, hands the newest camera frame to the LCD if the LCD is
+     * free, and once a second publishes frame-rate statistics.
      */
-    static bool     trigger_seen = false;
-    static uint32_t since_dump   = 0U;
+    static bool     lcd_holds_frame = false;
+    static uint32_t stats_start     = 0U;
+    static uint32_t camera_base     = 0U;
+    static uint32_t display_base    = 0U;
 
-    uint8_t cmd       = 0U;
-    bool    want_dump = (HAL_UART_Receive(&huart3, &cmd, 1U, 5U) == HAL_OK)
-                        && ((cmd == 'c') || (cmd == 'C'));
-
-    if (want_dump)
+    /* Debug path: 'c' on the UART stops the preview, takes a snapshot,
+     * dumps it for Tools/live_view.py / recv_frame.py, and resumes. */
+    if ((USART3->ISR & USART_ISR_ORE) != 0U)
     {
-      trigger_seen = true;
-    }
-    else if (!trigger_seen && (++since_dump >= 8U))
-    {
-      /* No trigger has ever arrived, so RX is probably not wired up (only
-       * PD8 is needed to listen).  Fall back to sending a frame every so
-       * often, which keeps the port usable without a second wire. */
-      since_dump = 0U;
-      want_dump  = true;
+      USART3->ICR = USART_ICR_ORECF;
     }
 
-    Log("capture...\r\n");
-
-    Camera_Status_t status = Camera_Capture(3000U);
-
-    Log("  -> %s after %lu attempt(s), %lu/%lu words left\r\n",
-        Camera_StatusName(status),
-        (unsigned long)Camera_GetLastAttempts(),
-        (unsigned long)Camera_GetTimeoutRemainingWords(),
-        (unsigned long)Camera_GetExpectedWords());
-
-    if (status == CAMERA_OK)
+    if ((USART3->ISR & USART_ISR_RXNE) != 0U)
     {
-      /* Heartbeat: green toggles once per captured frame. */
+      uint8_t cmd = (uint8_t)USART3->RDR;
+
+      if ((cmd == 'c') || (cmd == 'C'))
+      {
+        Lcd_WaitIdle();
+        Camera_LiveRelease();
+        lcd_holds_frame = false;
+
+        Camera_StopLive();
+        Debug_SnapshotToUart();
+
+        if (Camera_StartLive() != CAMERA_OK)
+        {
+          Log("live preview failed to restart\r\n");
+        }
+
+        camera_base = Camera_GetLiveFrameCount();
+      }
+    }
+
+    if ((pclk_sysdiv_request >= 1U) && (pclk_sysdiv_request <= 15U) &&
+        (pclk_sysdiv_request != pclk_sysdiv_active))
+    {
+      uint32_t sysdiv = pclk_sysdiv_request;
+
+      if (OV5640_WriteReg(0x3035U,   /* SC_PLL_CTRL1: [7:4] sysdiv */
+                          (uint8_t)((sysdiv << 4) | 0x01U)) == HAL_OK)
+      {
+        pclk_sysdiv_active = sysdiv;
+        Log("sensor sysdiv -> %lu\r\n", (unsigned long)sysdiv);
+      }
+
+      pclk_sysdiv_request = 0U;
+    }
+
+    if (!Lcd_IsBusy())
+    {
+      int32_t index;
+
+      if (lcd_holds_frame)
+      {
+        Camera_LiveRelease();
+        lcd_holds_frame = false;
+      }
+
+      index = Camera_LiveAcquire();
+
+      if (index >= 0)
+      {
+        lcd_holds_frame = true;
+        Lcd_BlitAsync((const uint16_t *)Camera_GetFrameBuffer((uint32_t)index));
+      }
+    }
+
+    if ((HAL_GetTick() - stats_start) >= 1000U)
+    {
+      uint32_t now_ms   = HAL_GetTick();
+      uint32_t camera   = Camera_GetLiveFrameCount();
+      uint32_t display  = Lcd_GetFrameCount();
+      uint32_t interval = now_ms - stats_start;
+
+      preview_stats.camera_fps   = ((camera - camera_base) * 1000U) / interval;
+      preview_stats.display_fps  = ((display - display_base) * 1000U) / interval;
+      preview_stats.overruns     = Camera_GetOverrunCount();
+      preview_stats.short_frames = Camera_GetLiveShortCount();
+      preview_stats.dropped      = Camera_GetLiveDroppedCount();
+
+      Log("camera %lu fps, display %lu fps, overruns %lu, short %lu, "
+          "dropped %lu\r\n",
+          (unsigned long)preview_stats.camera_fps,
+          (unsigned long)preview_stats.display_fps,
+          (unsigned long)preview_stats.overruns,
+          (unsigned long)preview_stats.short_frames,
+          (unsigned long)preview_stats.dropped);
+
+      camera_base  = camera;
+      display_base = display;
+      stats_start  = now_ms;
+
+      /* Heartbeat: green toggles once a second while preview runs. */
       HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0);
-
-      if (Camera_LastFrameHadOverrun())
-      {
-        Log("frame ok but overran (%lu total) - may show a tear; "
-            "raise OV5640_PLL_SYSDIV\r\n",
-            (unsigned long)Camera_GetOverrunCount());
-      }
-
-      if (want_dump)
-      {
-        Camera_DumpFrameUart(&huart3);
-      }
-    }
-    else
-    {
-      Log("capture failed: %s (overruns %lu, DMA %lu/%lu words left)\r\n",
-          Camera_StatusName(status),
-          (unsigned long)Camera_GetOverrunCount(),
-          (unsigned long)Camera_GetTimeoutRemainingWords(),
-          (unsigned long)Camera_GetExpectedWords());
-
-      {
-        uint32_t cr, sr, risr, misr, frames, vsyncs;
-
-        Camera_GetDebugRegs(&cr, &sr, &risr, &misr, &frames, &vsyncs);
-        Log("  DCMI CR=%08lX SR=%08lX RISR=%08lX MISR=%08lX\r\n",
-            (unsigned long)cr, (unsigned long)sr,
-            (unsigned long)risr, (unsigned long)misr);
-        Log("  IRQ counts: frame=%lu vsync=%lu, attempts=%lu\r\n",
-            (unsigned long)frames, (unsigned long)vsyncs,
-            (unsigned long)Camera_GetLastAttempts());
-      }
-
-      /* One red pulse per failure. The full blink code is reserved for
-       * Camera_Init, where there is no working UART to fall back on -
-       * here the log line above says far more, far faster. */
-      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
-      HAL_Delay(60U);
-      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
     }
   }
   /* USER CODE END 3 */
@@ -718,6 +946,46 @@ static void MX_I2C2_Init(void)
 }
 
 /**
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
+{
+
+  /* USER CODE BEGIN SPI1_Init 0 */
+
+  /* USER CODE END SPI1_Init 0 */
+
+  /* USER CODE BEGIN SPI1_Init 1 */
+
+  /* USER CODE END SPI1_Init 1 */
+  /* SPI1 parameter configuration*/
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 7;
+  hspi1.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
+  hspi1.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI1_Init 2 */
+
+  /* USER CODE END SPI1_Init 2 */
+
+}
+
+/**
   * @brief USART3 Initialization Function
   * @param None
   * @retval None
@@ -776,7 +1044,13 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOE, GPIO_PIN_2, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_7, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOF, LCD_RST_Pin|T_CS_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(LCD_CS_GPIO_Port, LCD_CS_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOD, LCD_DC_Pin|GPIO_PIN_7, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : PE2 */
   GPIO_InitStruct.Pin = GPIO_PIN_2;
@@ -785,12 +1059,49 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : LCD_RST_Pin */
+  GPIO_InitStruct.Pin = LCD_RST_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(LCD_RST_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : T_CS_Pin */
+  GPIO_InitStruct.Pin = T_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(T_CS_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : SHUTTER_Pin */
+  GPIO_InitStruct.Pin = SHUTTER_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(SHUTTER_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : T_IRQ_Pin */
+  GPIO_InitStruct.Pin = T_IRQ_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(T_IRQ_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : LCD_CS_Pin LCD_DC_Pin */
+  GPIO_InitStruct.Pin = LCD_CS_Pin|LCD_DC_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
   /*Configure GPIO pin : PD7 */
   GPIO_InitStruct.Pin = GPIO_PIN_7;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 10, 0);
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 

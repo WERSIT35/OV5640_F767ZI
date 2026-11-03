@@ -44,7 +44,13 @@ _Min_Stack_Size = 0x400; /* required amount of stack */
 /* Memories definition */
 MEMORY
 {
-  RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 512K
+  /* RAM is the 128K DTCM only: zero wait state, never cached, and still
+   * reachable by DMA2 through the AHBS port.  .data, .bss, heap and stack
+   * all live here.  SRAM1+SRAM2 (384K) are kept for the frame buffers in
+   * .framebuf, which MPU region 1 makes non-cacheable (see Cache_Config in
+   * main.c), so DCMI and SPI DMA never need cache maintenance. */
+  RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 128K
+  SRAM   (xrw)    : ORIGIN = 0x20020000,   LENGTH = 384K
   FLASH    (rx)    : ORIGIN = 0x8000000,   LENGTH = 2048K
 }
 
@@ -175,6 +181,16 @@ SECTIONS
     . = . + _Min_Stack_Size;
     . = ALIGN(8);
   } >RAM
+
+  /* Camera / display frame buffers.  NOLOAD: never zeroed or copied by the
+   * startup code, the camera fills them before anything reads them. */
+  .framebuf (NOLOAD) :
+  {
+    . = ALIGN(32);
+    *(.framebuf)
+    *(.framebuf*)
+    . = ALIGN(32);
+  } >SRAM
 
   /* Remove information from the compiler libraries */
   /DISCARD/ :

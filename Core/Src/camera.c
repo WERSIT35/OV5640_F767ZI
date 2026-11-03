@@ -17,19 +17,31 @@ extern DCMI_HandleTypeDef hdcmi;
 /* -------------------------------------------------------------------------- */
 
 /*
- * 320 x 240 x 2 = 153,600 bytes, which lands in .bss.  On the STM32F7 the
- * DTCM is reachable by DMA1/DMA2 through the CPU's AHBS slave port, so it
- * does not matter whether the buffer ends up in DTCM or SRAM1 - and the two
- * are contiguous in this linker script, so a buffer this large will straddle
- * the boundary anyway.
+ * Two 320 x 240 x 2 = 153,600 byte buffers for ping-pong live preview: the
+ * DCMI fills one while SPI DMA sends the other to the LCD.  They live in
+ * .framebuf (SRAM1), which MPU region 1 marks non-cacheable, so neither DMA
+ * ever sees stale cache lines and no cache maintenance is needed.  The CPU
+ * never touches pixel data on the live path, so caching would buy nothing.
  *
- * Aligned to 32 bytes so that if the D-cache is ever enabled, cache
- * maintenance on this buffer stays cache-line aligned.
+ * Each buffer carries CAMERA_LIVE_SLACK spare bytes past the frame.  In live
+ * mode the DMA is armed for slightly more than a frame and re-armed at every
+ * end-of-frame, so a sensor that sends a few extra words spills into the
+ * slack instead of the next buffer, and one that sends a few too few does
+ * not leave the DMA out of step with frame boundaries.
+ *
+ * Snapshot captures (the UART debug path) use buffer 0.
  */
-static uint8_t camera_frame_buffer[OV5640_FRAME_SIZE_BYTES] __attribute__((aligned(32)));
+#define CAMERA_LIVE_SLACK       (OV5640_FRAME_WIDTH * OV5640_BYTES_PER_PIXEL * 2U)
+#define CAMERA_BUFFER_BYTES     (OV5640_FRAME_SIZE_BYTES + CAMERA_LIVE_SLACK)
+
+static uint8_t camera_frame_buffers[2][CAMERA_BUFFER_BYTES]
+    __attribute__((aligned(32), section(".framebuf")));
+
+#define camera_frame_buffer     (camera_frame_buffers[0])
 
 /* DCMI moves data as 32-bit words, so the DMA length is in words, not bytes. */
 #define CAMERA_DMA_WORD_COUNT   (OV5640_FRAME_SIZE_BYTES / 4U)
+#define CAMERA_LIVE_WORD_COUNT  (CAMERA_BUFFER_BYTES / 4U)
 
 /*
  * How much of the tail may be missing and still count as a good frame.
@@ -156,7 +168,7 @@ Camera_Status_t Camera_Init(void)
   camera_overrun_count    = 0U;
   camera_sync_error_count = 0U;
 
-  memset(camera_frame_buffer, 0, sizeof(camera_frame_buffer));
+  memset(camera_frame_buffers, 0, sizeof(camera_frame_buffers));
 
   Camera_EnableXclk();
 
@@ -358,7 +370,7 @@ static Camera_Status_t Camera_CaptureOnce(uint32_t timeout_ms)
   {
     uint32_t written = (CAMERA_DMA_WORD_COUNT - camera_timeout_remaining) * 4U;
     memset(&camera_frame_buffer[written], 0,
-           sizeof(camera_frame_buffer) - written);
+           OV5640_FRAME_SIZE_BYTES - written);
   }
 
   return CAMERA_OK;
@@ -449,7 +461,7 @@ const uint8_t *Camera_GetBuffer(void)
 
 uint32_t Camera_GetBufferSize(void)
 {
-  return (uint32_t)sizeof(camera_frame_buffer);
+  return OV5640_FRAME_SIZE_BYTES;
 }
 
 uint32_t Camera_GetOverrunCount(void)
@@ -470,6 +482,232 @@ uint32_t Camera_GetExpectedWords(void)
 uint32_t Camera_GetLastFrameMs(void)
 {
   return camera_last_frame_ms;
+}
+
+uint8_t *Camera_GetFrameBuffer(uint32_t index)
+{
+  return camera_frame_buffers[index & 1U];
+}
+
+/* -------------------------------------------------------------------------- */
+/* Live preview: continuous capture, ping-pong between the two buffers        */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * HAL's continuous mode is not used here.  It arms the DMA once and lets it
+ * run, so the buffer boundary only lines up with the frame boundary if every
+ * frame is exactly width*height*2 bytes - and this sensor is not exact.
+ * Instead the DCMI end-of-frame interrupt stops the stream, hands the
+ * finished buffer over, and re-arms into the other one.  That happens at the
+ * start of vertical blanking, hundreds of lines before the next frame.
+ *
+ * Buffer ownership, all indices 0/1 or -1:
+ *   live_cap   - DMA is writing into it
+ *   live_ready - newest complete frame, not yet claimed by the display
+ *   live_held  - claimed by the display, being sent over SPI
+ * The DMA is never pointed at live_held, so a frame on screen never tears.
+ */
+
+#define CAMERA_DMA_STREAM       DMA2_Stream1
+#define CAMERA_DMA_FLAGS        (DMA_LIFCR_CFEIF1 | DMA_LIFCR_CDMEIF1 | \
+                                 DMA_LIFCR_CTEIF1 | DMA_LIFCR_CHTIF1  | \
+                                 DMA_LIFCR_CTCIF1)
+
+static volatile bool     camera_live;
+static volatile int32_t  live_cap;
+static volatile int32_t  live_ready;
+static volatile int32_t  live_held;
+static volatile uint32_t live_frames;
+static volatile uint32_t live_short_frames;
+static volatile uint32_t live_dropped;
+
+/** Point DMA2 Stream1 at a buffer and start it, bypassing HAL. */
+static void Camera_LiveArm(int32_t index)
+{
+  DMA_Stream_TypeDef *s = CAMERA_DMA_STREAM;
+
+  s->CR &= ~DMA_SxCR_EN;
+  while ((s->CR & DMA_SxCR_EN) != 0U) { }
+
+  DMA2->LIFCR = CAMERA_DMA_FLAGS;
+
+  /* Keep the channel/burst/FIFO setup HAL_DMA_Init made in
+   * Camera_MspDmaInit; only take the interrupts away from HAL, since the
+   * DCMI end-of-frame drives everything here. */
+  s->CR  &= ~(DMA_SxCR_TCIE | DMA_SxCR_HTIE | DMA_SxCR_TEIE |
+              DMA_SxCR_DMEIE | DMA_SxCR_DBM | DMA_SxCR_CIRC);
+  s->FCR &= ~DMA_SxFCR_FEIE;
+
+  s->PAR  = (uint32_t)&DCMI->DR;
+  s->M0AR = (uint32_t)camera_frame_buffers[index];
+  s->NDTR = CAMERA_LIVE_WORD_COUNT;
+
+  live_cap = index;
+
+  s->CR |= DMA_SxCR_EN;
+}
+
+/** End of frame in live mode. Runs in the DCMI interrupt. */
+static void Camera_LiveFrameEnd(void)
+{
+  DMA_Stream_TypeDef *s = CAMERA_DMA_STREAM;
+  int32_t  done = live_cap;
+  int32_t  next;
+  uint32_t received;
+
+  /* Disabling a peripheral-to-memory stream flushes its FIFO to memory
+   * before EN reads back as 0, so the tail of the frame is in place. */
+  s->CR &= ~DMA_SxCR_EN;
+  while ((s->CR & DMA_SxCR_EN) != 0U) { }
+
+  received = CAMERA_LIVE_WORD_COUNT - s->NDTR;
+
+  if ((DCMI->RISR & DCMI_RIS_OVR_RIS) != 0U)
+  {
+    camera_overrun_count++;
+    DCMI->ICR = DCMI_ICR_OVR_ISC;
+  }
+
+  if ((received + CAMERA_MAX_MISSING_WORDS) >= CAMERA_DMA_WORD_COUNT)
+  {
+    live_frames++;
+    live_ready = done;
+  }
+  else
+  {
+    /* The first frame after arming, or one cut short by an overrun. */
+    live_short_frames++;
+  }
+
+  /* Capture into the other buffer, unless the display is still sending it;
+   * then the frame just finished is the only one free, and it is lost. */
+  next = 1 - done;
+
+  if (next == live_held)
+  {
+    next = done;
+    live_dropped++;
+  }
+
+  if (live_ready == next)
+  {
+    live_ready = -1;
+  }
+
+  Camera_LiveArm(next);
+}
+
+Camera_Status_t Camera_StartLive(void)
+{
+  Camera_Stop();
+
+  live_ready        = -1;
+  live_held         = -1;
+  live_frames       = 0U;
+  live_short_frames = 0U;
+  live_dropped      = 0U;
+
+  /* Start in the blanking gap so the first frame is whole. */
+  if (!Camera_WaitForFrameGap(1000U))
+  {
+    __HAL_DCMI_DISABLE(&hdcmi);
+    return CAMERA_ERR_TIMEOUT;
+  }
+
+  camera_live = true;
+
+  Camera_LiveArm(0);
+
+  /* Continuous mode (CM = 0): the DCMI keeps capturing frame after frame.
+   * Only the end-of-frame interrupt is used; overruns are read from RISR. */
+  DCMI->ICR = DCMI_ICR_FRAME_ISC | DCMI_ICR_OVR_ISC | DCMI_ICR_ERR_ISC |
+              DCMI_ICR_VSYNC_ISC | DCMI_ICR_LINE_ISC;
+  DCMI->IER = DCMI_IER_FRAME_IE;
+  DCMI->CR  = (DCMI->CR & ~DCMI_CR_CM) | DCMI_CR_ENABLE | DCMI_CR_CAPTURE;
+
+  return CAMERA_OK;
+}
+
+void Camera_StopLive(void)
+{
+  if (!camera_live)
+  {
+    return;
+  }
+
+  DCMI->CR  &= ~DCMI_CR_CAPTURE;
+  DCMI->IER  = 0U;
+
+  CAMERA_DMA_STREAM->CR &= ~DMA_SxCR_EN;
+  while ((CAMERA_DMA_STREAM->CR & DMA_SxCR_EN) != 0U) { }
+  DMA2->LIFCR = CAMERA_DMA_FLAGS;
+
+  __HAL_DCMI_DISABLE(&hdcmi);
+
+  camera_live = false;
+  live_ready  = -1;
+  live_held   = -1;
+}
+
+int32_t Camera_LiveAcquire(void)
+{
+  int32_t index;
+
+  __disable_irq();
+
+  index = live_ready;
+
+  if (index >= 0)
+  {
+    live_held  = index;
+    live_ready = -1;
+  }
+
+  __enable_irq();
+
+  return index;
+}
+
+void Camera_LiveRelease(void)
+{
+  live_held = -1;
+}
+
+uint32_t Camera_GetLiveFrameCount(void)
+{
+  return live_frames;
+}
+
+uint32_t Camera_GetLiveShortCount(void)
+{
+  return live_short_frames;
+}
+
+uint32_t Camera_GetLiveDroppedCount(void)
+{
+  return live_dropped;
+}
+
+void Camera_DcmiIrqHandler(void)
+{
+  uint32_t misr;
+
+  if (!camera_live)
+  {
+    HAL_DCMI_IRQHandler(&hdcmi);
+    return;
+  }
+
+  misr = DCMI->MISR;
+
+  /* Clear everything except OVR, which Camera_LiveFrameEnd reads raw. */
+  DCMI->ICR = DCMI_ICR_FRAME_ISC | DCMI_ICR_ERR_ISC |
+              DCMI_ICR_VSYNC_ISC | DCMI_ICR_LINE_ISC;
+
+  if ((misr & DCMI_MIS_FRAME_MIS) != 0U)
+  {
+    Camera_LiveFrameEnd();
+  }
 }
 
 /* -------------------------------------------------------------------------- */

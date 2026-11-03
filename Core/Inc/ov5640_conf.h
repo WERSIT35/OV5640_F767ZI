@@ -93,16 +93,27 @@ extern "C" {
  *     sysdiv  4  ->  ~13   MHz    (needs HCLK >= 33 MHz)
  *     sysdiv  6  ->  ~8.7  MHz    (needs HCLK >= 22 MHz)
  *     sysdiv  8  ->  ~6.5  MHz    (needs HCLK >= 17 MHz)
- *     sysdiv 12  ->  ~4.4  MHz    (safe at 16 MHz)   <-- default
+ *     sysdiv 12  ->  ~4.4  MHz    (safe at 16 MHz)
  *     sysdiv 16  ->  ~3.3  MHz
  *
- * Frame rate is roughly PCLK / 1.87e6 for the VGA line timing used here,
- * so sysdiv 12 gives about 2 fps.  Lower this number to go faster.  If you
- * set it too low, the DCMI overrun flag fires and Camera_Capture() reports
- * CAMERA_ERR_OVERRUN.  Left unchanged by the 216 MHz switch on purpose, so
- * the sensor side behaves exactly as before until it is tuned.
+ * Lower this number to go faster.  If you set it too low, the DCMI overrun
+ * flag fires (counted in preview_stats.overruns, and reported by
+ * Camera_Capture() as CAMERA_ERR_OVERRUN).
+ *
+ * Measured in live preview (XCLK 16 MHz, HCLK 216 MHz, LCD SPI 54 MHz),
+ * by writing pclk_sysdiv_request over SWD and reading preview_stats:
+ *
+ *     sysdiv 15 ->  3-4 fps     sysdiv 4 -> 13-14 fps
+ *     sysdiv  8 ->    7 fps     sysdiv 3 -> 18-19 fps
+ *     sysdiv  6 ->    9 fps     sysdiv 2 -> 27-28 fps   <-- default
+ *
+ * all with 0 overruns, 0 short and 0 dropped frames; the display kept up
+ * with every frame.  sysdiv 1 was not characterised: the board stopped
+ * answering SWD during that step and was then found in a reset loop at
+ * boot, which points at the supply rather than the sensor - re-test it
+ * once the power is confirmed solid.
  */
-#define OV5640_PLL_SYSDIV         15U
+#define OV5640_PLL_SYSDIV         2U
 
 /* -------------------------------------------------------------------------- */
 /* XCLK (sensor master clock)                                                 */
