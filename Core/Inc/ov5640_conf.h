@@ -77,7 +77,7 @@ extern "C" {
 
 /*
  * The DCMI can only sample DCMI_PIXCLK if its period is longer than
- * 2.5 x HCLK.  The MCU now runs from HSE bypass through the PLL:
+ * 2.5 x HCLK.  The MCU now runs from HSI through the PLL:
  *
  *     HCLK = 216 MHz  ->  PIXCLK must stay below ~86 MHz
  *
@@ -122,11 +122,11 @@ extern "C" {
  * file by 16/24 - making them more conservative, not less.  Leaving this
  * enabled is harmless if you never wire PA8 up.
  *
- * HSI is kept even though SYSCLK now comes from HSE + PLL, because MCO1
+ * HSI is kept for MCO1 even though SYSCLK now comes from the PLL, because MCO1
  * has no better option: its sources are HSI, LSE, HSE (8 MHz, near the
  * bottom of the range) and the 216 MHz PLL, which even at the maximum /5
- * prescaler is 43 MHz - far too fast.  HSI stays on after the switch;
- * HAL_RCC_OscConfig in SystemClock_Config only touches HSE and the PLL.
+ * prescaler is 43 MHz - far too fast.
+ * The PLL also runs from HSI, so XCLK and SYSCLK share one source.
  */
 #define OV5640_DRIVE_XCLK_FROM_MCO1   1
 

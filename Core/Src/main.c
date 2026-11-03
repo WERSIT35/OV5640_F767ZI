@@ -585,11 +585,12 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-  RCC_OscInitStruct.HSEState = RCC_HSE_BYPASS;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLM = 4;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 8;
   RCC_OscInitStruct.PLL.PLLN = 216;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = 9;
@@ -766,7 +767,6 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOF_CLK_ENABLE();
-  __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
@@ -844,9 +844,11 @@ void Error_Handler(void)
    * harmless if they already are. */
   Diag_LedInit();
 
-  /* HSE bypass relies on the ST-LINK's 8 MHz MCO.  If it never arrived, say
-   * so specifically rather than with the generic pattern below. */
-  if ((RCC->CR & RCC_CR_HSERDY) == 0U)
+  /* HSE bypass relies on the ST-LINK's 8 MHz MCO.  If it was requested but
+   * never arrived, say so specifically rather than with the generic pattern
+   * below.  The PLL currently runs from HSI (this board's MCO does not reach
+   * PH0), so HSEON is clear and this only fires if HSE is switched back on. */
+  if (((RCC->CR & RCC_CR_HSEON) != 0U) && ((RCC->CR & RCC_CR_HSERDY) == 0U))
   {
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0 | GPIO_PIN_14, GPIO_PIN_RESET);
 
