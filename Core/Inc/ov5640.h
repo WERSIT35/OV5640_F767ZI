@@ -88,6 +88,48 @@ HAL_StatusTypeDef OV5640_SetBrightness(int8_t level);
 /** Contrast in the range -4..+4 (0 = neutral). */
 HAL_StatusTypeDef OV5640_SetContrast(int8_t level);
 
+/* -------------------------------------------------------------------------- */
+/* Picture controls (values from OmniVision's OV5640 application notes)       */
+/* -------------------------------------------------------------------------- */
+
+typedef enum
+{
+  OV5640_EFFECT_NORMAL = 0,
+  OV5640_EFFECT_MONO,
+  OV5640_EFFECT_SEPIA,
+  OV5640_EFFECT_NEGATIVE,
+  OV5640_EFFECT_RED,
+  OV5640_EFFECT_GREEN,
+  OV5640_EFFECT_BLUE,
+  OV5640_EFFECT_COUNT
+} OV5640_Effect_t;
+
+typedef enum
+{
+  OV5640_WB_AUTO = 0,
+  OV5640_WB_SUNNY,
+  OV5640_WB_CLOUDY,
+  OV5640_WB_OFFICE,      /* fluorescent */
+  OV5640_WB_HOME,        /* incandescent */
+  OV5640_WB_COUNT
+} OV5640_WhiteBalance_t;
+
+/** Exposure compensation steps: -3..+3 in thirds of a stop (-1.0..+1.0 EV). */
+#define OV5640_EV_MIN   (-3)
+#define OV5640_EV_MAX   (3)
+
+/** Colour effect via the special digital effects (SDE) block. */
+HAL_StatusTypeDef OV5640_SetEffect(OV5640_Effect_t effect);
+
+/** Auto or one of the manual white balance presets. */
+HAL_StatusTypeDef OV5640_SetWhiteBalance(OV5640_WhiteBalance_t wb);
+
+/** Shift the auto-exposure target, OV5640_EV_MIN..OV5640_EV_MAX. */
+HAL_StatusTypeDef OV5640_SetExposureComp(int8_t step);
+
+/** Night mode: lets AEC stretch frame time (lower fps) in low light. */
+HAL_StatusTypeDef OV5640_SetNightMode(bool enable);
+
 #ifdef __cplusplus
 }
 #endif

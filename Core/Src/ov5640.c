@@ -288,3 +288,116 @@ HAL_StatusTypeDef OV5640_SetContrast(int8_t level)
 
   return OV5640_ModifyReg(0x5588U, 0x04U, 0x04U);          /* contrast on */
 }
+
+/* -------------------------------------------------------------------------- */
+/* Picture controls                                                           */
+/* -------------------------------------------------------------------------- */
+
+HAL_StatusTypeDef OV5640_SetEffect(OV5640_Effect_t effect)
+{
+  /* SDE control 0x5580, U/V fixed values 0x5583/0x5584, 0x5003 = 0x08.
+   * The tints and mono work by replacing U and V with constants. */
+  static const uint8_t table[OV5640_EFFECT_COUNT][3] =
+  {
+    { 0x06, 0x40, 0x2C },   /* normal: saturation + contrast only */
+    { 0x1E, 0x80, 0x80 },   /* mono                               */
+    { 0x1E, 0x40, 0xA0 },   /* sepia                              */
+    { 0x46, 0x40, 0x28 },   /* negative                           */
+    { 0x1E, 0x80, 0xC0 },   /* red tint                           */
+    { 0x1E, 0x60, 0x60 },   /* green tint                         */
+    { 0x1E, 0xA0, 0x40 },   /* blue tint                          */
+  };
+
+  if (effect >= OV5640_EFFECT_COUNT)
+  {
+    return HAL_ERROR;
+  }
+
+  if ((OV5640_ModifyReg(0x5001U, 0x80U, 0x80U) != HAL_OK) ||   /* SDE on */
+      (OV5640_WriteReg(0x5580U, table[effect][0]) != HAL_OK) ||
+      (OV5640_WriteReg(0x5583U, table[effect][1]) != HAL_OK) ||
+      (OV5640_WriteReg(0x5584U, table[effect][2]) != HAL_OK))
+  {
+    return HAL_ERROR;
+  }
+
+  return OV5640_WriteReg(0x5003U, 0x08U);
+}
+
+HAL_StatusTypeDef OV5640_SetWhiteBalance(OV5640_WhiteBalance_t wb)
+{
+  /* Manual R, G, B gains, 0x3400..0x3405 (12-bit, high byte first). */
+  static const uint8_t gains[OV5640_WB_COUNT][6] =
+  {
+    { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },   /* auto: unused */
+    { 0x06, 0x1C, 0x04, 0x00, 0x04, 0xF3 },   /* sunny        */
+    { 0x06, 0x48, 0x04, 0x00, 0x04, 0xD3 },   /* cloudy       */
+    { 0x05, 0x48, 0x04, 0x00, 0x07, 0xCF },   /* office       */
+    { 0x04, 0x10, 0x04, 0x00, 0x08, 0x40 },   /* home         */
+  };
+
+  if (wb >= OV5640_WB_COUNT)
+  {
+    return HAL_ERROR;
+  }
+
+  if (wb == OV5640_WB_AUTO)
+  {
+    return OV5640_WriteReg(0x3406U, 0x00U);
+  }
+
+  if (OV5640_WriteReg(0x3406U, 0x01U) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  for (uint16_t i = 0U; i < 6U; i++)
+  {
+    if (OV5640_WriteReg((uint16_t)(0x3400U + i), gains[wb][i]) != HAL_OK)
+    {
+      return HAL_ERROR;
+    }
+  }
+
+  return HAL_OK;
+}
+
+HAL_StatusTypeDef OV5640_SetExposureComp(int8_t step)
+{
+  /* AEC stable-range high/low (0x3A0F/0x3A10), fast-zone high (0x3A11),
+   * and the matching 0x3A1B/0x3A1E/0x3A1F, for -1.0 .. +1.0 EV. */
+  static const uint16_t regs[6] = { 0x3A0F, 0x3A10, 0x3A11,
+                                    0x3A1B, 0x3A1E, 0x3A1F };
+  static const uint8_t  table[7][6] =
+  {
+    { 0x20, 0x18, 0x41, 0x20, 0x18, 0x10 },   /* -1.0 EV */
+    { 0x28, 0x20, 0x51, 0x28, 0x20, 0x10 },   /* -0.7 EV */
+    { 0x30, 0x28, 0x61, 0x30, 0x28, 0x10 },   /* -0.3 EV */
+    { 0x38, 0x30, 0x61, 0x38, 0x30, 0x10 },   /*  0   EV */
+    { 0x40, 0x38, 0x71, 0x40, 0x38, 0x10 },   /* +0.3 EV */
+    { 0x48, 0x40, 0x81, 0x48, 0x40, 0x10 },   /* +0.7 EV */
+    { 0x50, 0x48, 0x90, 0x50, 0x48, 0x20 },   /* +1.0 EV */
+  };
+  uint32_t index;
+
+  if (step < OV5640_EV_MIN) { step = OV5640_EV_MIN; }
+  if (step > OV5640_EV_MAX) { step = OV5640_EV_MAX; }
+
+  index = (uint32_t)(step - OV5640_EV_MIN);
+
+  for (uint32_t i = 0U; i < 6U; i++)
+  {
+    if (OV5640_WriteReg(regs[i], table[index][i]) != HAL_OK)
+    {
+      return HAL_ERROR;
+    }
+  }
+
+  return HAL_OK;
+}
+
+HAL_StatusTypeDef OV5640_SetNightMode(bool enable)
+{
+  /* 0x3A00[2]: night mode, AEC may insert extra frame time. */
+  return OV5640_ModifyReg(0x3A00U, 0x04U, enable ? 0x04U : 0x00U);
+}
