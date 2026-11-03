@@ -646,6 +646,10 @@ int main(void)
   Diag_CameraPinSweep();
 #endif
 
+  /* Display first, so a camera fault can be shown on it as well as blinked. */
+  Lcd_Init();
+  Lcd_SelfTest();
+
   {
     Camera_Status_t status = Camera_Init();
 
@@ -657,6 +661,7 @@ int main(void)
 
       /* Blink the failure out rather than halting silently: the enum value
        * is the flash count. See Camera_Status_t in camera.h. */
+      App_ShowFault(ICON_CAMERA);
       Diag_BlinkCodeForever((uint32_t)status);
     }
   }
@@ -665,9 +670,6 @@ int main(void)
       (unsigned)OV5640_FRAME_WIDTH, (unsigned)OV5640_FRAME_HEIGHT,
       (unsigned long)Camera_GetBufferSize());
   Log("send 'c' to receive one frame\r\n");
-
-  Lcd_Init();
-  Lcd_SelfTest();
 
   /* Calibrate on first boot (nothing saved yet), or when the shutter button
    * (PF14) is held while the board starts. */
@@ -686,6 +688,7 @@ int main(void)
     if (status != CAMERA_OK)
     {
       Log("Camera_StartLive failed: %s\r\n", Camera_StatusName(status));
+      App_ShowFault(ICON_CAMERA);
       Diag_BlinkCodeForever((uint32_t)status);
     }
   }
@@ -1078,7 +1081,7 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOE, GPIO_PIN_2, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOF, LCD_RST_Pin|T_CS_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOF, LCD_RST_Pin|T_CS_Pin|SD_CS_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LCD_CS_GPIO_Port, LCD_CS_Pin, GPIO_PIN_SET);
@@ -1093,6 +1096,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : VBAT_SENSE_Pin */
+  GPIO_InitStruct.Pin = VBAT_SENSE_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(VBAT_SENSE_GPIO_Port, &GPIO_InitStruct);
+
   /*Configure GPIO pin : LCD_RST_Pin */
   GPIO_InitStruct.Pin = LCD_RST_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
@@ -1100,12 +1109,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
   HAL_GPIO_Init(LCD_RST_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : T_CS_Pin */
-  GPIO_InitStruct.Pin = T_CS_Pin;
+  /*Configure GPIO pins : T_CS_Pin SD_CS_Pin */
+  GPIO_InitStruct.Pin = T_CS_Pin|SD_CS_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-  HAL_GPIO_Init(T_CS_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
 
   /*Configure GPIO pin : SHUTTER_Pin */
   GPIO_InitStruct.Pin = SHUTTER_Pin;

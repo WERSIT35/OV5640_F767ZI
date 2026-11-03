@@ -25,6 +25,7 @@ extern "C" {
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "icons.h"
 
 /** Reset settings to defaults and push them to the sensor. */
 void App_Init(void);
@@ -43,6 +44,13 @@ void App_SetFps(uint32_t camera_fps, uint32_t display_fps);
 
 /** True once if the user asked for touch recalibration from the menu. */
 bool App_TakeCalibrationRequest(void);
+
+/**
+  * @brief  Full-screen fault picture: a large icon struck through in red,
+  *         e.g. ICON_CAMERA when the sensor does not answer.  Blocking.
+  * @note   Shown alongside, not instead of, the LED blink codes.
+  */
+void App_ShowFault(Icon_t icon);
 
 #ifdef __cplusplus
 }

@@ -12,6 +12,10 @@
 #include "touch.h"
 #include "ov5640.h"
 #include "main.h"
+#include "icons.h"
+#include "power.h"
+#include "sd.h"
+#include "camera.h"
 #include <stdio.h>
 
 /* -------------------------------------------------------------------------- */
@@ -36,17 +40,8 @@ typedef struct
 
 static App_Settings_t app;
 
-static const char *const effect_names[OV5640_EFFECT_COUNT] =
-  { "STD", "B&W", "SEPIA", "NEG", "RED", "GREEN", "BLUE" };
-
-static const char *const wb_names[OV5640_WB_COUNT] =
-  { "AUTO", "SUN", "CLOUD", "OFFICE", "HOME" };
-
 static const char *const ev_names[7] =
   { "-1.0", "-0.7", "-0.3", "0.0", "+0.3", "+0.7", "+1.0" };
-
-static const char *const orient_names[4] =
-  { "STD", "MIRROR", "FLIP", "ROT180" };
 
 /* The sensor table starts mirrored (0x3821 = 0x07), which is "STD" here. */
 static void app_apply_orient(void)
@@ -80,14 +75,6 @@ typedef enum
   MI_DRAW,   MI_CAL,   MI_SHOT,    MI_CLOSE,
   MI_COUNT
 } Menu_Item_t;
-
-static const char *const menu_titles[MI_COUNT] =
-{
-  "EFFECT", "WB",     "EV -",  "EV +",
-  "GRID",   "HISTO",  "ZEBRA", "PEAKING",
-  "ZOOM",   "ORIENT", "NIGHT", "TIMER",
-  "DRAW",   "TOUCH",  "SHOOT", "CLOSE",
-};
 
 /* Menu: 4 x 4 buttons over the live image. */
 #define MENU_X0     10
@@ -168,30 +155,6 @@ static int menu_hit(int x, int y)
   }
 
   return -1;
-}
-
-/** Current value of a menu item, as shown under its title. */
-static const char *menu_value(int item)
-{
-  switch (item)
-  {
-    case MI_EFFECT: return effect_names[app.effect];
-    case MI_WB:     return wb_names[app.wb];
-    case MI_EV_DOWN:
-    case MI_EV_UP:  return ev_names[app.ev - OV5640_EV_MIN];
-    case MI_GRID:   return app.grid  ? "ON" : "OFF";
-    case MI_HIST:   return app.hist  ? "ON" : "OFF";
-    case MI_ZEBRA:  return app.zebra ? "ON" : "OFF";
-    case MI_PEAK:   return app.peak  ? "ON" : "OFF";
-    case MI_ZOOM:   return app.zoom  ? "2X" : "1X";
-    case MI_ORIENT: return orient_names[app.orient];
-    case MI_NIGHT:  return app.night ? "ON" : "OFF";
-    case MI_TIMER:  return app.timer ? "3S" : "OFF";
-    case MI_DRAW:   return app.draw  ? "ON" : "OFF";
-    case MI_CAL:    return "CALIB";
-    case MI_SHOT:   return "";
-    default:        return "";
-  }
 }
 
 static bool menu_is_on(int item)
@@ -370,6 +333,8 @@ void App_Init(void)
   (void)OV5640_SetWhiteBalance(app.wb);
   (void)OV5640_SetExposureComp(app.ev);
   (void)OV5640_SetNightMode(app.night);
+
+  Power_Init();
 }
 
 void App_Poll(void)
@@ -402,7 +367,17 @@ void App_Poll(void)
     app_shoot();
   }
 
-  if (Lcd_IsBusy() || ((now - last_poll) < TOUCH_POLL_MS))
+  Power_Poll();
+
+  if (Lcd_IsBusy())
+  {
+    return;
+  }
+
+  /* Shares SPI1 with the LCD and touch, so only while the LCD is idle. */
+  Sd_Poll();
+
+  if ((now - last_poll) < TOUCH_POLL_MS)
   {
     return;
   }
@@ -466,41 +441,169 @@ bool App_WantsFrame(void)
   return !(frozen && freeze_shown);
 }
 
-static void draw_status(uint16_t *fb)
+/* -------------------------------------------------------------------------- */
+/* Drawing: icons rather than text wherever an icon says it                   */
+/* -------------------------------------------------------------------------- */
+
+#define STATUS_H     20
+#define ICON_STEP    20
+
+static const Icon_t wb_icons[OV5640_WB_COUNT] =
+  { ICON_AUTO_WB, ICON_SUN, ICON_CLOUD, ICON_TUBE, ICON_BULB };
+
+/** Icon for a menu item; WB shows the active preset. */
+static Icon_t menu_icon(int item)
 {
-  char text[64];
-
-  Gfx_Darken(fb, 0, 0, GFX_W, 14);
-
-  (void)snprintf(text, sizeof(text), "%s  WB %s  EV %s%s%s",
-                 effect_names[app.effect], wb_names[app.wb],
-                 ev_names[app.ev - OV5640_EV_MIN],
-                 app.zoom  ? "  2X"    : "",
-                 app.night ? "  NIGHT" : "");
-  (void)Gfx_Text(fb, 4, 3, text, LCD_WHITE, 1);
-
-  (void)snprintf(text, sizeof(text), "%lu FPS", (unsigned long)fps_display);
-  (void)Gfx_Text(fb, GFX_W - 4 - Gfx_TextWidth(text, 1), 3, text,
-                 COLOUR_ACCENT, 1);
+  switch (item)
+  {
+    case MI_WB:      return wb_icons[app.wb];
+    case MI_EV_DOWN: return ICON_MINUS;
+    case MI_EV_UP:   return ICON_PLUS;
+    case MI_GRID:    return ICON_GRID;
+    case MI_HIST:    return ICON_HISTOGRAM;
+    case MI_ZEBRA:   return ICON_ZEBRA;
+    case MI_PEAK:    return ICON_PEAKING;
+    case MI_ZOOM:    return ICON_ZOOM;
+    case MI_ORIENT:  return ICON_ORIENT;
+    case MI_NIGHT:   return ICON_MOON;
+    case MI_TIMER:   return ICON_TIMER;
+    case MI_DRAW:    return ICON_PENCIL;
+    case MI_CAL:     return ICON_TARGET;
+    case MI_SHOT:    return ICON_CAMERA;
+    case MI_CLOSE:
+    default:         return ICON_CLOSE;
+  }
 }
 
-static void draw_button(uint16_t *fb, int x, int y, int w, int h,
-                        const char *title, const char *value, bool on)
+/** Short value under a menu icon, only where the icon alone is ambiguous. */
+static const char *menu_caption(int item)
 {
-  Gfx_Darken(fb, x, y, w, h);
-  Gfx_Frame(fb, x, y, w, h, on ? COLOUR_ON : COLOUR_GREY);
+  static const char *const orient_short[4] = { "", "MIR", "FLIP", "180" };
 
-  if ((value != NULL) && (value[0] != '\0'))
+  switch (item)
   {
-    (void)Gfx_Text(fb, x + ((w - Gfx_TextWidth(title, 1)) / 2),
-                   y + (h / 2) - 10, title, LCD_WHITE, 1);
-    (void)Gfx_Text(fb, x + ((w - Gfx_TextWidth(value, 1)) / 2),
-                   y + (h / 2) + 3, value, on ? COLOUR_ON : COLOUR_ACCENT, 1);
+    case MI_EV_DOWN:
+    case MI_EV_UP:   return ev_names[app.ev - OV5640_EV_MIN];
+    case MI_ZOOM:    return app.zoom ? "2X" : "";
+    case MI_ORIENT:  return orient_short[app.orient];
+    default:         return "";
+  }
+}
+
+static uint16_t battery_colour(int percent)
+{
+  if (percent < POWER_LOW_PERCENT) { return LCD_RED; }
+  if (percent < 50)                { return COLOUR_YELLOW; }
+  return COLOUR_ON;
+}
+
+static void draw_status(uint16_t *fb)
+{
+  bool blink = ((HAL_GetTick() / 400U) & 1U) != 0U;
+  int  x     = 4;
+  int  rx;
+  char text[8];
+
+  Gfx_Darken(fb, 0, 0, GFX_W, STATUS_H);
+
+  /* Left: what the picture is set to. */
+  Icon_Draw(fb, x, 2, wb_icons[app.wb], LCD_WHITE, 1);
+  x += ICON_STEP;
+
+  Icon_EffectSwatch(fb, x, 2, (int)app.effect, 1);
+  x += ICON_STEP;
+
+  if (app.ev != 0)
+  {
+    x += Gfx_Text(fb, x, 6, ev_names[app.ev - OV5640_EV_MIN],
+                  COLOUR_ACCENT, 1) + 4;
+  }
+
+  if (app.night) { Icon_Draw(fb, x, 2, ICON_MOON,   LCD_WHITE, 1); x += ICON_STEP; }
+  if (app.timer) { Icon_Draw(fb, x, 2, ICON_TIMER,  COLOUR_ACCENT, 1); x += ICON_STEP; }
+  if (app.zoom)  { Icon_Draw(fb, x, 2, ICON_ZOOM,   LCD_WHITE, 1); x += ICON_STEP; }
+  if (app.draw)  { Icon_Draw(fb, x, 2, ICON_PENCIL, COLOUR_YELLOW, 1); x += ICON_STEP; }
+
+  /* Right, from the edge inwards: power, storage, temperature, frame rate. */
+  rx = GFX_W - 4;
+
+  if (Power_HasBattery())
+  {
+    int percent = Power_GetPercent();
+    int digits;
+
+    (void)snprintf(text, sizeof(text), "%d", percent);
+    digits = Gfx_TextWidth(text, 1);
+    rx -= digits;
+    (void)Gfx_Text(fb, rx, 6, text, LCD_WHITE, 1);
+    rx -= 4 + 23;
+
+    if ((percent >= POWER_CRITICAL_PERCENT) || blink)
+    {
+      Icon_Battery(fb, rx, 4, percent, battery_colour(percent), 1);
+    }
   }
   else
   {
-    (void)Gfx_Text(fb, x + ((w - Gfx_TextWidth(title, 1)) / 2),
-                   y + (h / 2) - 3, title, LCD_WHITE, 1);
+    rx -= ICON_SIZE;
+    Icon_Draw(fb, rx, 2, ICON_PLUG, LCD_WHITE, 1);
+  }
+
+  rx -= ICON_STEP;
+
+  if (Sd_IsPresent())
+  {
+    Icon_Draw(fb, rx, 2, ICON_SD, LCD_WHITE, 1);
+  }
+  else
+  {
+    Icon_Draw(fb, rx, 2, ICON_SD, COLOUR_GREY, 1);
+    Icon_Slash(fb, rx, 2, 1);
+  }
+
+  if (Power_GetTempC() >= POWER_HOT_CELSIUS)
+  {
+    rx -= ICON_STEP;
+    Icon_Draw(fb, rx, 2, ICON_THERMO, blink ? LCD_RED : COLOUR_ACCENT, 1);
+  }
+
+  (void)snprintf(text, sizeof(text), "%lu", (unsigned long)fps_display);
+  rx -= 8 + Gfx_TextWidth(text, 1);
+  (void)Gfx_Text(fb, rx, 6, text, COLOUR_GREY, 1);
+}
+
+/** Large blinking battery in the middle of the screen when nearly empty. */
+static void draw_battery_warning(uint16_t *fb)
+{
+  if (!Power_HasBattery() ||
+      (Power_GetPercent() >= POWER_CRITICAL_PERCENT) ||
+      (((HAL_GetTick() / 400U) & 1U) == 0U))
+  {
+    return;
+  }
+
+  Gfx_Darken(fb, (GFX_W / 2) - 50, (GFX_H / 2) - 26, 100, 52);
+  Icon_Battery(fb, (GFX_W / 2) - 42, (GFX_H / 2) - 18, 0, LCD_RED, 3);
+}
+
+static void draw_icon_button(uint16_t *fb, int x, int y, int w, int h,
+                             Icon_t icon, const char *caption, bool on)
+{
+  uint16_t colour   = on ? COLOUR_ON : LCD_WHITE;
+  bool     has_text = (caption != NULL) && (caption[0] != '\0');
+  int      scale    = (h >= 40) ? 2 : 1;
+  int      size     = ICON_SIZE * scale;
+  int      iy       = y + ((h - size - (has_text ? 9 : 0)) / 2);
+
+  Gfx_Darken(fb, x, y, w, h);
+  Gfx_Frame(fb, x, y, w, h, on ? COLOUR_ON : COLOUR_GREY);
+
+  Icon_Draw(fb, x + ((w - size) / 2), iy, icon, colour, scale);
+
+  if (has_text)
+  {
+    (void)Gfx_Text(fb, x + ((w - Gfx_TextWidth(caption, 1)) / 2),
+                   iy + size + 2, caption, COLOUR_ACCENT, 1);
   }
 }
 
@@ -512,8 +615,18 @@ static void draw_menu(uint16_t *fb)
     int y;
 
     menu_rect(i, &x, &y);
-    draw_button(fb, x, y, MENU_BW, MENU_BH, menu_titles[i], menu_value(i),
-                menu_is_on(i));
+
+    if (i == MI_EFFECT)
+    {
+      Gfx_Darken(fb, x, y, MENU_BW, MENU_BH);
+      Gfx_Frame(fb, x, y, MENU_BW, MENU_BH, COLOUR_GREY);
+      Icon_EffectSwatch(fb, x + ((MENU_BW - 32) / 2),
+                        y + ((MENU_BH - 32) / 2), (int)app.effect, 2);
+      continue;
+    }
+
+    draw_icon_button(fb, x, y, MENU_BW, MENU_BH, menu_icon(i),
+                     menu_caption(i), menu_is_on(i));
   }
 }
 
@@ -535,6 +648,7 @@ static void draw_trail(uint16_t *fb)
     Gfx_Fill(fb, touch_now.x - 4, touch_now.y - 4, 9, 9, LCD_RED);
   }
 }
+
 
 void App_ProcessFrame(uint16_t *frame)
 {
@@ -570,15 +684,15 @@ void App_ProcessFrame(uint16_t *frame)
   /* ...then the interface on top. */
   if (frozen)
   {
-    const char *msg = "REVIEW - TAP TO RESUME";
-    char        count[24];
+    char count[12];
 
-    Gfx_Darken(frame, 0, GFX_H - 20, GFX_W, 20);
-    (void)Gfx_Text(frame, (GFX_W - Gfx_TextWidth(msg, 1)) / 2, GFX_H - 14,
-                   msg, LCD_WHITE, 1);
-    (void)snprintf(count, sizeof(count), "SHOT %lu", (unsigned long)shots);
-    Gfx_Darken(frame, 0, 0, GFX_W, 14);
-    (void)Gfx_Text(frame, 4, 3, count, COLOUR_ACCENT, 1);
+    /* Review: white border, camera icon and the shot number. */
+    Gfx_Frame(frame, 0, 0, GFX_W, GFX_H, LCD_WHITE);
+    Gfx_Frame(frame, 1, 1, GFX_W - 2, GFX_H - 2, LCD_WHITE);
+    Gfx_Darken(frame, 6, 6, 60, 22);
+    Icon_Draw(frame, 9, 9, ICON_CAMERA, LCD_WHITE, 1);
+    (void)snprintf(count, sizeof(count), "%lu", (unsigned long)shots);
+    (void)Gfx_Text(frame, 30, 13, count, COLOUR_ACCENT, 1);
     freeze_shown = true;
     return;
   }
@@ -601,10 +715,10 @@ void App_ProcessFrame(uint16_t *frame)
   }
   else
   {
-    draw_button(frame, SHOT_X, SHOT_Y, SHOT_W, SHOT_H,
-                app.timer ? "TIMER" : "SHOOT", NULL, false);
-    draw_button(frame, MENU_BTN_X, SHOT_Y, SHOT_W, SHOT_H, "MENU", NULL,
-                false);
+    draw_icon_button(frame, SHOT_X, SHOT_Y, SHOT_W, SHOT_H,
+                     app.timer ? ICON_TIMER : ICON_CAMERA, NULL, false);
+    draw_icon_button(frame, MENU_BTN_X, SHOT_Y, SHOT_W, SHOT_H, ICON_MENU,
+                     NULL, false);
   }
 
   if (timer_deadline != 0U)
@@ -617,6 +731,23 @@ void App_ProcessFrame(uint16_t *frame)
     (void)Gfx_Text(frame, (GFX_W - Gfx_TextWidth(digit, 8)) / 2,
                    (GFX_H - 56) / 2, digit, COLOUR_ACCENT, 8);
   }
+
+  draw_battery_warning(frame);
+}
+
+void App_ShowFault(Icon_t icon)
+{
+  uint16_t *fb   = (uint16_t *)Camera_GetFrameBuffer(0U);
+  int       size = ICON_SIZE * 6;
+  int       x    = (GFX_W - size) / 2;
+  int       y    = (GFX_H - size) / 2;
+
+  Lcd_WaitIdle();
+  Gfx_Fill(fb, 0, 0, GFX_W, GFX_H, 0x0000U);
+  Icon_Draw(fb, x, y, icon, LCD_WHITE, 6);
+  Icon_Slash(fb, x, y, 6);
+  Lcd_BlitAsync(fb);
+  Lcd_WaitIdle();
 }
 
 void App_SetFps(uint32_t camera_fps, uint32_t display_fps)
