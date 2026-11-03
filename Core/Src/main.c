@@ -36,6 +36,10 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+/* Red blink code for "HSE never became ready" - see Error_Handler.  Picks up
+ * where the Camera_Status_t codes (2..9) leave off. */
+#define DIAG_CODE_NO_HSE      10U
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -76,7 +80,8 @@ static void MX_USART3_UART_Init(void);
  * LD2 is on PB7, which this project uses for DCMI_VSYNC.
  *
  * During start-up the markers latch, so a hang is readable long afterwards:
- *   both dark        -> not executing, or stuck in SystemClock_Config
+ *   both dark        -> not executing at all
+ *   red x10, repeat  -> HSE never came up (no 8 MHz MCO from the ST-LINK)
  *   green on         -> clock/SysTick/GPIO fine, stuck in an MX_*_Init
  *   green + red on   -> all init done, but the USART never asserted TC
  *   green off, red on-> UART transmitted; stuck in Camera_Init
@@ -137,6 +142,20 @@ static void Diag_BlinkCode(uint32_t code)
   }
 
   HAL_Delay(700U);
+}
+
+/**
+  * @brief  Busy-wait roughly `ms` milliseconds without SysTick.
+  * @note   For fault paths only, where interrupts are off and HAL_Delay would
+  *         hang.  Scaled by SystemCoreClock so the blink rate is the same at
+  *         16 MHz (HSE failed, still on HSI) and at 216 MHz.  The ~8 cycles
+  *         per iteration is approximate; it only has to be readable by eye.
+  */
+static void Diag_SpinMs(uint32_t ms)
+{
+  uint32_t n = (SystemCoreClock / 8000U) * ms;
+
+  for (volatile uint32_t i = 0U; i < n; i++) { }
 }
 
 /** Repeat a blink code forever. Never returns. */
@@ -403,6 +422,11 @@ int main(void)
   }
 
   Log("\r\n=== OV5640 / DCMI capture ===\r\n");
+  Log("SYSCLK %lu Hz, PCLK1 %lu Hz, PCLK2 %lu Hz, USART3 %lu baud\r\n",
+      (unsigned long)HAL_RCC_GetSysClockFreq(),
+      (unsigned long)HAL_RCC_GetPCLK1Freq(),
+      (unsigned long)HAL_RCC_GetPCLK2Freq(),
+      (unsigned long)huart3.Init.BaudRate);
   Log("HCLK %lu Hz -> max DCMI PIXCLK ~%lu Hz\r\n",
       (unsigned long)HAL_RCC_GetHCLKFreq(),
       (unsigned long)((HAL_RCC_GetHCLKFreq() * 2UL) / 5UL));
@@ -556,16 +580,28 @@ void SystemClock_Config(void)
   /** Configure the main internal regulator output voltage
   */
   __HAL_RCC_PWR_CLK_ENABLE();
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_BYPASS;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 4;
+  RCC_OscInitStruct.PLL.PLLN = 216;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 9;
+  RCC_OscInitStruct.PLL.PLLR = 2;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Activate the Over-Drive mode
+  */
+  if (HAL_PWREx_EnableOverDrive() != HAL_OK)
   {
     Error_Handler();
   }
@@ -574,12 +610,12 @@ void SystemClock_Config(void)
   */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_7) != HAL_OK)
   {
     Error_Handler();
   }
@@ -648,7 +684,7 @@ static void MX_I2C2_Init(void)
 
   /* USER CODE END I2C2_Init 1 */
   hi2c2.Instance = I2C2;
-  hi2c2.Init.Timing = 0x00303D5B;
+  hi2c2.Init.Timing = 0x20404768;
   hi2c2.Init.OwnAddress1 = 0;
   hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
@@ -696,7 +732,7 @@ static void MX_USART3_UART_Init(void)
 
   /* USER CODE END USART3_Init 1 */
   huart3.Instance = USART3;
-  huart3.Init.BaudRate = 115200;
+  huart3.Init.BaudRate = 2000000;
   huart3.Init.WordLength = UART_WORDLENGTH_8B;
   huart3.Init.StopBits = UART_STOPBITS_1;
   huart3.Init.Parity = UART_PARITY_NONE;
@@ -730,6 +766,7 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOF_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
@@ -801,6 +838,32 @@ void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
   __disable_irq();
+
+  /* SystemClock_Config runs before Diag_LedInit, so a clock failure lands
+   * here with the LED pins still unconfigured.  Initialising them again is
+   * harmless if they already are. */
+  Diag_LedInit();
+
+  /* HSE bypass relies on the ST-LINK's 8 MHz MCO.  If it never arrived, say
+   * so specifically rather than with the generic pattern below. */
+  if ((RCC->CR & RCC_CR_HSERDY) == 0U)
+  {
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0 | GPIO_PIN_14, GPIO_PIN_RESET);
+
+    for (;;)
+    {
+      for (uint32_t i = 0U; i < DIAG_CODE_NO_HSE; i++)
+      {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
+        Diag_SpinMs(250U);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
+        Diag_SpinMs(250U);
+      }
+
+      Diag_SpinMs(1400U);
+    }
+  }
+
   while (1)
   {
     /* Flash both LEDs together so reaching Error_Handler is distinguishable
@@ -808,7 +871,7 @@ void Error_Handler(void)
      * SysTick never advances and HAL_Delay would block forever. */
     HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0 | GPIO_PIN_14);
 
-    for (volatile uint32_t i = 0U; i < 400000U; i++) { }
+    Diag_SpinMs(200U);
   }
   /* USER CODE END Error_Handler_Debug */
 }

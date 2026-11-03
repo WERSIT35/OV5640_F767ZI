@@ -14,9 +14,10 @@ Keys:
     space   save the current frame as a PNG
     q       quit
 
-At 115200 baud a 320x240 RGB565 frame takes ~13 s to transfer, so this is a
+At 2 Mbaud a 320x240 RGB565 frame takes ~0.8 s to transfer, so this is a
 slideshow rather than video.  The frame time is dominated entirely by the
-UART, not by the sensor or the display.
+UART, not by the sensor or the display.  The live preview proper is the TFT;
+this is the debug path.
 """
 
 import argparse
@@ -48,7 +49,7 @@ class Receiver(threading.Thread):
 
     Only raw payloads cross into the UI thread; converting to RGB happens
     there, so toggling byte order can re-render the frame already in hand
-    without waiting another 13 seconds for a new one.
+    without waiting for a new one.
     """
 
     daemon = True
@@ -223,8 +224,8 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("port", nargs="?", help="serial port, e.g. COM5")
-    parser.add_argument("--baud", type=int, default=115200,
-                        help="must match MX_USART3_UART_Init (default: 115200)")
+    parser.add_argument("--baud", type=int, default=2000000,
+                        help="must match MX_USART3_UART_Init (default: 2000000)")
     parser.add_argument("--swap", action="store_true",
                         help="start with RGB565 byte swap enabled")
     parser.add_argument("--timeout", type=float, default=30.0,

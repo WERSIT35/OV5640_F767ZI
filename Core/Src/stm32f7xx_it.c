@@ -91,9 +91,11 @@ void HardFault_Handler(void)
   {
     /* USER CODE BEGIN W1_HardFault_IRQn 0 */
     /* Flash both LEDs fast so a fault is obvious rather than looking like a
-     * hang.  Busy-wait: HAL_Delay needs SysTick, which is unreliable here. */
+     * hang.  Busy-wait: HAL_Delay needs SysTick, which is unreliable here.
+     * Scaled by SystemCoreClock (~75 ms per toggle at any clock) so it
+     * stays a visible flash at 216 MHz instead of a dim steady glow. */
     GPIOB->ODR ^= (GPIO_PIN_0 | GPIO_PIN_14);
-    for (volatile uint32_t i = 0U; i < 150000U; i++) { }
+    for (volatile uint32_t i = 0U; i < SystemCoreClock / 107U; i++) { }
     /* USER CODE END W1_HardFault_IRQn 0 */
   }
 }

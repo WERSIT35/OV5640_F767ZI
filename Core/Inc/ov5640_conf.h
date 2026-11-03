@@ -77,14 +77,18 @@ extern "C" {
 
 /*
  * The DCMI can only sample DCMI_PIXCLK if its period is longer than
- * 2.5 x HCLK.  This project currently runs on HSI with no PLL:
+ * 2.5 x HCLK.  The MCU now runs from HSE bypass through the PLL:
  *
- *     HCLK = 16 MHz  ->  PIXCLK must stay below ~6.4 MHz
+ *     HCLK = 216 MHz  ->  PIXCLK must stay below ~86 MHz
+ *
+ * so the DCMI itself is no longer the limit; the DMA/bus load and the
+ * sensor's own maximum are (see task 6 tuning).  It was 16 MHz / ~6.4 MHz
+ * on HSI, which is what the table below was originally sized against.
  *
  * PCLK is scaled by the sensor PLL system divider in register 0x3035[7:4].
  * With the PLL settings in ov5640_regs.h (24 MHz XCLK, pre-div 3,
  * multiplier 105, root divider /2, 8-bit mode, 0x3824 = /2) the divider maps
- * roughly as:
+ * roughly as follows - scale by 16/24 for the 16 MHz XCLK actually used:
  *
  *     sysdiv  4  ->  ~13   MHz    (needs HCLK >= 33 MHz)
  *     sysdiv  6  ->  ~8.7  MHz    (needs HCLK >= 22 MHz)
@@ -93,9 +97,10 @@ extern "C" {
  *     sysdiv 16  ->  ~3.3  MHz
  *
  * Frame rate is roughly PCLK / 1.87e6 for the VGA line timing used here,
- * so sysdiv 12 gives about 2 fps.  Raise HCLK (enable the PLL in CubeMX)
- * and then lower this number to go faster.  If you set it too low, the
- * DCMI overrun flag fires and Camera_Capture() reports CAMERA_ERR_OVERRUN.
+ * so sysdiv 12 gives about 2 fps.  Lower this number to go faster.  If you
+ * set it too low, the DCMI overrun flag fires and Camera_Capture() reports
+ * CAMERA_ERR_OVERRUN.  Left unchanged by the 216 MHz switch on purpose, so
+ * the sensor side behaves exactly as before until it is tuned.
  */
 #define OV5640_PLL_SYSDIV         15U
 
@@ -112,10 +117,16 @@ extern "C" {
  * Many modules carry their own 24 MHz oscillator.  If yours does not, set
  * this to 1 and wire PA8 (MCO1) to the module's XCLK / MCLK pin.
  *
- * With the PLL disabled, MCO1 can only pass HSI straight through at 16 MHz.
- * That sits inside the OV5640's 6-27 MHz XCLK range, and it scales every
- * PCLK estimate in this file by 16/24 - making them more conservative, not
- * less.  Leaving this enabled is harmless if you never wire PA8 up.
+ * MCO1 passes HSI straight through at 16 MHz.  That sits inside the
+ * OV5640's 6-27 MHz XCLK range, and it scales every PCLK estimate in this
+ * file by 16/24 - making them more conservative, not less.  Leaving this
+ * enabled is harmless if you never wire PA8 up.
+ *
+ * HSI is kept even though SYSCLK now comes from HSE + PLL, because MCO1
+ * has no better option: its sources are HSI, LSE, HSE (8 MHz, near the
+ * bottom of the range) and the 216 MHz PLL, which even at the maximum /5
+ * prescaler is 43 MHz - far too fast.  HSI stays on after the switch;
+ * HAL_RCC_OscConfig in SystemClock_Config only touches HSE and the PLL.
  */
 #define OV5640_DRIVE_XCLK_FROM_MCO1   1
 

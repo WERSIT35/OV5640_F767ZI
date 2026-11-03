@@ -42,7 +42,7 @@ HEADER_STRUCT = struct.Struct("<HHBBI")   # width, height, bpp, format, length
 HEADER_SIZE = HEADER_STRUCT.size
 
 # Read granularity. Must be large enough that we are not doing a syscall per
-# byte at 1 Mbaud (125 KB/s), or the driver buffer overflows and we silently
+# byte at 2 Mbaud (200 KB/s), or the driver buffer overflows and we silently
 # lose data mid-frame.
 CHUNK = 65536
 
@@ -237,9 +237,9 @@ def main():
     parser.add_argument("port", nargs="?",
                         help="serial port, e.g. COM5 or /dev/ttyACM0; "
                              "omit to list what is available")
-    parser.add_argument("--baud", type=int, default=115200,
+    parser.add_argument("--baud", type=int, default=2000000,
                         help="baud rate; must match MX_USART3_UART_Init "
-                             "(default: 115200)")
+                             "(default: 2000000)")
     parser.add_argument("--count", type=int, default=1,
                         help="frames to capture; 0 means run until Ctrl-C")
     parser.add_argument("--prefix", default="frame_",
@@ -266,7 +266,7 @@ def main():
                  "open - close PuTTY and try again.")
 
     with opened as port:
-        # Windows defaults to a small driver buffer; at 1 Mbaud that overflows
+        # Windows defaults to a small driver buffer; at 2 Mbaud that overflows
         # during the Python-side pixel conversion between frames.
         try:
             port.set_buffer_size(rx_size=1 << 20)
