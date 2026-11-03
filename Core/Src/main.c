@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 #include "camera.h"
 #include "lcd.h"
+#include "touch.h"
 #include "ov5640.h"
 #include <stdio.h>
 #include <stdarg.h>
@@ -481,6 +482,124 @@ static void Lcd_SelfTest(void)
       (unsigned long)(preview_stats.fill_fps_x10 % 10U));
 }
 
+/* ==========================================================================
+ * Touch test overlay: a red dot under the finger and a yellow trail that
+ * fades after TRAIL_MS, drawn into the camera frame just before it is sent
+ * to the LCD.  The frame buffer is claimed by the display at that point, so
+ * the camera cannot overwrite the overlay mid-blit.
+ * ========================================================================== */
+
+#define TRAIL_LEN        160U
+#define TRAIL_MS         1500U
+#define TOUCH_POLL_MS    10U
+
+#define COLOUR_YELLOW    0xFFE0U
+
+typedef struct
+{
+  int16_t  x;
+  int16_t  y;
+  uint32_t t;
+} Trail_Point_t;
+
+/* Latest reading, also handy to watch over SWD. */
+typedef struct
+{
+  uint32_t presses;           /* press events since reset                   */
+  uint16_t raw_x, raw_y, raw_z;
+  int16_t  x, y;
+  uint8_t  pressed;
+} Touch_Stats_t;
+
+volatile Touch_Stats_t touch_stats;
+
+static Trail_Point_t trail[TRAIL_LEN];
+static uint32_t      trail_head;
+static Touch_Point_t touch_now;
+
+/** Sample the panel at most every TOUCH_POLL_MS. LCD must be idle. */
+static void TouchTest_Poll(void)
+{
+  static uint32_t last_poll;
+  static bool     was_pressed;
+  uint32_t        now = HAL_GetTick();
+
+  if ((now - last_poll) < TOUCH_POLL_MS)
+  {
+    return;
+  }
+
+  last_poll = now;
+
+  Touch_Read(&touch_now);
+
+  if (touch_now.pressed)
+  {
+    const Trail_Point_t *prev = &trail[(trail_head + TRAIL_LEN - 1U) % TRAIL_LEN];
+    int32_t dx = touch_now.x - prev->x;
+    int32_t dy = touch_now.y - prev->y;
+
+    /* Only record movement, so holding still does not flood the trail. */
+    if (!was_pressed || ((dx * dx) + (dy * dy) >= 4))
+    {
+      trail[trail_head].x = touch_now.x;
+      trail[trail_head].y = touch_now.y;
+      trail[trail_head].t = now;
+      trail_head = (trail_head + 1U) % TRAIL_LEN;
+    }
+
+    if (!was_pressed)
+    {
+      touch_stats.presses++;
+    }
+
+    touch_stats.raw_x = touch_now.raw_x;
+    touch_stats.raw_y = touch_now.raw_y;
+    touch_stats.raw_z = touch_now.raw_z;
+    touch_stats.x     = touch_now.x;
+    touch_stats.y     = touch_now.y;
+  }
+
+  was_pressed         = touch_now.pressed;
+  touch_stats.pressed = touch_now.pressed ? 1U : 0U;
+}
+
+/** Fill a (2r+1)-square centred on (x, y), clipped to the frame. */
+static void Frame_Dot(uint16_t *frame, int32_t x, int32_t y, int32_t r,
+                      uint16_t colour)
+{
+  for (int32_t yy = y - r; yy <= y + r; yy++)
+  {
+    if ((yy < 0) || (yy >= (int32_t)LCD_HEIGHT)) { continue; }
+
+    for (int32_t xx = x - r; xx <= x + r; xx++)
+    {
+      if ((xx < 0) || (xx >= (int32_t)LCD_WIDTH)) { continue; }
+
+      frame[(yy * (int32_t)LCD_WIDTH) + xx] = colour;
+    }
+  }
+}
+
+static void TouchTest_Draw(uint16_t *frame)
+{
+  uint32_t now = HAL_GetTick();
+
+  for (uint32_t i = 0U; i < TRAIL_LEN; i++)
+  {
+    if ((trail[i].t != 0U) && ((now - trail[i].t) < TRAIL_MS))
+    {
+      Frame_Dot(frame, trail[i].x, trail[i].y, 1, COLOUR_YELLOW);
+    }
+  }
+
+  if (touch_now.pressed)
+  {
+    Frame_Dot(frame, touch_now.x, touch_now.y, 5, LCD_WHITE);
+    Frame_Dot(frame, touch_now.x, touch_now.y, 4, LCD_RED);
+  }
+}
+
 static const char *Camera_StatusName(Camera_Status_t status)
 {
   switch (status)
@@ -667,6 +786,15 @@ int main(void)
   Lcd_Init();
   Lcd_SelfTest();
 
+  /* Calibrate on first boot (nothing saved yet), or when the shutter button
+   * (PF14) is held while the board starts. */
+  if (!Touch_Init() ||
+      (HAL_GPIO_ReadPin(SHUTTER_GPIO_Port, SHUTTER_Pin) == GPIO_PIN_RESET))
+  {
+    Log("touch: calibrating - tap the three crosshairs\r\n");
+    Touch_Calibrate();
+  }
+
   {
     Camera_Status_t status = Camera_StartLive();
 
@@ -755,12 +883,19 @@ int main(void)
         lcd_holds_frame = false;
       }
 
+      /* The bus is free between blits, so this is the only safe moment to
+       * talk to the touch controller. */
+      TouchTest_Poll();
+
       index = Camera_LiveAcquire();
 
       if (index >= 0)
       {
+        uint16_t *frame = (uint16_t *)Camera_GetFrameBuffer((uint32_t)index);
+
         lcd_holds_frame = true;
-        Lcd_BlitAsync((const uint16_t *)Camera_GetFrameBuffer((uint32_t)index));
+        TouchTest_Draw(frame);
+        Lcd_BlitAsync(frame);
       }
     }
 

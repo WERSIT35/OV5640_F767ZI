@@ -89,6 +89,19 @@ static inline void lcd_dc_data(bool data)
 /* SPI register helpers                                                       */
 /* -------------------------------------------------------------------------- */
 
+/** CR1.BR encoding of LCD_SPI_DIV: divide by 2^(BR+1). */
+static uint32_t lcd_spi_br_bits(void)
+{
+  uint32_t br = 0U;
+
+  while (((2UL << br) < LCD_SPI_DIV) && (br < 7U))
+  {
+    br++;
+  }
+
+  return br;
+}
+
 /** Wait until every bit queued so far has left the shift register. */
 static void spi_wait_idle(void)
 {
@@ -174,6 +187,71 @@ static void lcd_command(uint8_t cmd, const uint8_t *data, uint32_t len)
 
   spi_wait_idle();
   lcd_cs(false);
+}
+
+/**
+  * @brief  Read `len` bytes back after a command, for wiring diagnostics.
+  * @note   Needs the panel's SDO wired to PB4 - normally it is left off (see
+  *         lcd.h).  Reads run at APB2/32 = 3.4 MHz: the ILI9341 read cycle
+  *         is far slower than its write cycle.  The first byte returned by
+  *         most read commands is a dummy.
+  */
+static void lcd_read(uint8_t cmd, uint8_t *out, uint32_t len)
+{
+  uint32_t cr1 = SPI1->CR1;
+
+  spi_set_16bit(false);
+  spi_wait_idle();
+  SPI1->CR1 &= ~SPI_CR1_SPE;
+  SPI1->CR1  = (cr1 & ~(SPI_CR1_BR | SPI_CR1_SPE)) | (4U << SPI_CR1_BR_Pos);
+  SPI1->CR1 |= SPI_CR1_SPE;
+
+  lcd_cs(true);
+  lcd_write_cmd(cmd);
+  spi_flush_rx();
+
+  for (uint32_t i = 0U; i < len; i++)
+  {
+    spi_write8(0x00U);
+    while ((SPI1->SR & SPI_SR_RXNE) == 0U) { }
+    out[i] = *(__IO uint8_t *)&SPI1->DR;
+  }
+
+  spi_wait_idle();
+  lcd_cs(false);
+
+  SPI1->CR1 &= ~SPI_CR1_SPE;
+  SPI1->CR1  = cr1;
+}
+
+/*
+ * Read-back of the panel's own state after Lcd_Init, for SWD inspection:
+ *   [0..1] RDDPM  0x0A: dummy, power mode   - expect 0x9C (booster on,
+ *                       sleep out, normal mode, display on)
+ *   [2..3] RDDCOLMOD 0x0C: dummy, pixel fmt - expect 0x05/0x55 (16 bpp)
+ *   [4..7] RDID4  0xD3: dummy, 0x00, 0x93, 0x41
+ * All 0x00 or all 0xFF means nothing answered: SDO not wired to PB4, or
+ * the panel is not receiving commands at all.
+ */
+volatile uint8_t lcd_diag[8];
+
+static void lcd_read_diag(void)
+{
+  uint8_t buf[4];
+
+  lcd_read(0x0AU, buf, 2U);
+  lcd_diag[0] = buf[0];
+  lcd_diag[1] = buf[1];
+
+  lcd_read(0x0CU, buf, 2U);
+  lcd_diag[2] = buf[0];
+  lcd_diag[3] = buf[1];
+
+  lcd_read(0xD3U, buf, 4U);
+  lcd_diag[4] = buf[0];
+  lcd_diag[5] = buf[1];
+  lcd_diag[6] = buf[2];
+  lcd_diag[7] = buf[3];
 }
 
 /**
@@ -348,9 +426,9 @@ void Lcd_Init(void)
 
   __HAL_RCC_DMA2_CLK_ENABLE();
 
-  /* Clock: /2 = 54 MHz, or /4 = 27 MHz as the fallback. */
+  /* Clock: APB2 / LCD_SPI_DIV, see lcd.h. */
   SPI1->CR1 &= ~SPI_CR1_SPE;
-  SPI1->CR1 = (SPI1->CR1 & ~SPI_CR1_BR) | (LCD_SPI_SLOW ? SPI_CR1_BR_0 : 0U);
+  SPI1->CR1 = (SPI1->CR1 & ~SPI_CR1_BR) | (lcd_spi_br_bits() << SPI_CR1_BR_Pos);
   SPI1->CR1 |= SPI_CR1_SPE;
 
   spi_set_16bit(false);
@@ -381,6 +459,8 @@ void Lcd_Init(void)
 
   lcd_command(ILI_DISPON, NULL, 0U);
   HAL_Delay(20U);
+
+  lcd_read_diag();
 
   HAL_NVIC_SetPriority(LCD_DMA_IRQn, 7, 0);
   HAL_NVIC_EnableIRQ(LCD_DMA_IRQn);
@@ -444,5 +524,5 @@ uint32_t Lcd_GetFrameCount(void)
 
 uint32_t Lcd_GetSpiHz(void)
 {
-  return HAL_RCC_GetPCLK2Freq() / (LCD_SPI_SLOW ? 4U : 2U);
+  return HAL_RCC_GetPCLK2Freq() / LCD_SPI_DIV;
 }

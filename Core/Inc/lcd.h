@@ -30,12 +30,17 @@ extern "C" {
 #define LCD_HEIGHT   240U
 
 /*
- * SPI1 runs from APB2 (108 MHz).  /2 = 54 MHz is well past the ILI9341's
- * datasheet write timing but works on most modules with short wiring;
- * /4 = 27 MHz is the safe fallback.  Set to 1 if the picture shows noise,
- * wrong colours in patches, or stops updating.
+ * SPI1 clock divider from APB2 (108 MHz): 2, 4, 8, 16, 32, 64, 128 or 256.
+ *
+ *   2  -> 54   MHz  fastest; past the ILI9341 datasheet, needs short wiring
+ *   4  -> 27   MHz  the usual safe choice for jumper wires
+ *   16 -> 6.75 MHz  bring-up: rules signal integrity out entirely
+ *
+ * A white screen means the panel never saw a valid init sequence; noise,
+ * wrong colours in patches or a frozen picture mean the clock is too fast
+ * for the wiring.  Either way, raise this.
  */
-#define LCD_SPI_SLOW   0
+#define LCD_SPI_DIV    2U
 
 /*
  * Memory access control (0x36).  0x28 = landscape (MV) + BGR panel order.
