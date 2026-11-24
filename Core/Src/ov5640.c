@@ -396,8 +396,113 @@ HAL_StatusTypeDef OV5640_SetExposureComp(int8_t step)
   return HAL_OK;
 }
 
+/** Write a list of registers, stopping at the first failure. */
+static HAL_StatusTypeDef ov5640_write_list(const OV5640_RegVal_t *list,
+                                           uint32_t n)
+{
+  for (uint32_t i = 0U; i < n; i++)
+  {
+    if (OV5640_WriteReg(list[i].reg, list[i].val) != HAL_OK)
+    {
+      return HAL_ERROR;
+    }
+  }
+
+  return HAL_OK;
+}
+
 HAL_StatusTypeDef OV5640_SetNightMode(bool enable)
 {
+  /* Longest exposure is one frame (VTS = 984 lines) normally and three in
+   * night mode, where the gain ceiling is raised as well. */
+  uint16_t lines = enable ? (3U * 984U) : 984U;
+  uint16_t gain  = enable ? OV5640_GAIN_CEILING_NIGHT : OV5640_GAIN_CEILING;
+  const OV5640_RegVal_t list[] =
+  {
+    { 0x3A02U, (uint8_t)(lines >> 8) }, { 0x3A03U, (uint8_t)lines },
+    { 0x3A14U, (uint8_t)(lines >> 8) }, { 0x3A15U, (uint8_t)lines },
+    { 0x3A18U, (uint8_t)(gain >> 8) },  { 0x3A19U, (uint8_t)gain },
+  };
+
+  if (ov5640_write_list(list, sizeof(list) / sizeof(list[0])) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
   /* 0x3A00[2]: night mode, AEC may insert extra frame time. */
   return OV5640_ModifyReg(0x3A00U, 0x04U, enable ? 0x04U : 0x00U);
+}
+
+HAL_StatusTypeDef OV5640_SetStyle(OV5640_Style_t style)
+{
+  /* Colour matrix magnitudes 0x5384..0x5389 (saturation), then the largest
+   * sharpening the sensor's automatic mode may apply (0x5302). */
+  static const uint8_t table[OV5640_STYLE_COUNT][7] =
+  {
+    { 0x0D, 0x84, 0x91, 0x8A, 0x76, 0x14, 0x14 },   /* standard */
+    { 0x10, 0x9C, 0xAC, 0xA2, 0x8B, 0x17, 0x1C },   /* vivid    */
+    { 0x0B, 0x6C, 0x77, 0x70, 0x60, 0x10, 0x10 },   /* natural  */
+  };
+
+  if (style >= OV5640_STYLE_COUNT)
+  {
+    return HAL_ERROR;
+  }
+
+  const OV5640_RegVal_t list[] =
+  {
+    { 0x3212U, 0x03U },                  /* group 3: apply all at once */
+    { 0x5381U, 0x1DU }, { 0x5382U, 0x60U }, { 0x5383U, 0x03U },
+    { 0x5384U, table[style][0] }, { 0x5385U, table[style][1] },
+    { 0x5386U, table[style][2] }, { 0x5387U, table[style][3] },
+    { 0x5388U, table[style][4] }, { 0x5389U, table[style][5] },
+    { 0x538BU, 0x98U }, { 0x538AU, 0x01U },
+    { 0x5308U, 0x25U }, { 0x5302U, table[style][6] },
+    { 0x3212U, 0x13U }, { 0x3212U, 0xA3U },
+  };
+
+  return ov5640_write_list(list, sizeof(list) / sizeof(list[0]));
+}
+
+HAL_StatusTypeDef OV5640_SetZoom(uint8_t level)
+{
+  /* Array window { x0, y0, x1, y1 }.  Readout is 2x2 binned and loses the
+   * 16 x 6 ISP offset on each side, so these feed the scaler 1280x960,
+   * 640x480 and 320x240.  HTS/VTS stay put, so the frame rate does too. */
+  static const uint16_t win[OV5640_ZOOM_COUNT][4] =
+  {
+    {   0U,   4U, 2623U, 1947U },
+    { 640U, 484U, 1983U, 1467U },
+    { 960U, 724U, 1663U, 1227U },
+  };
+
+  if (level >= OV5640_ZOOM_COUNT)
+  {
+    return HAL_ERROR;
+  }
+
+  if (OV5640_WriteReg(0x3212U, 0x03U) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  for (uint16_t i = 0U; i < 4U; i++)
+  {
+    uint16_t v = win[level][i];
+
+    if ((OV5640_WriteReg((uint16_t)(0x3800U + (2U * i)),
+                         (uint8_t)(v >> 8)) != HAL_OK) ||
+        (OV5640_WriteReg((uint16_t)(0x3801U + (2U * i)),
+                         (uint8_t)v) != HAL_OK))
+    {
+      return HAL_ERROR;
+    }
+  }
+
+  if (OV5640_WriteReg(0x3212U, 0x13U) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  return OV5640_WriteReg(0x3212U, 0xA3U);
 }

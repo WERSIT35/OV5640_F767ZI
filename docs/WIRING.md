@@ -8,9 +8,9 @@ Zio headers. Pins with no such label are on the long two-row **morpho**
 headers along the edges (CN11 on the left, CN12 on the right); their names
 are printed on the underside of the board.
 
-> **Read the power section first.** A swapped GND/3V3 wire on this build
-> damaged the STM32 (it ran very hot from then on). Check polarity with a
-> meter before the first power-up of any new wiring.
+> **Read the power section first.** Swapped, missing or wrong-voltage supply
+> wires caused most of the faults on this build. Check polarity and voltage
+> with a meter before the first power-up of any new wiring.
 
 ---
 
@@ -35,8 +35,10 @@ Rules:
   3.3 V pin is ~100 mA and its 5 V passes through a small fuse; both
   collapse under the camera + display load (~350–450 mA).
 - **Never power anything from the ST-LINK.** It only debugs.
-- With the ST-LINK snapped off, remove jumper **JP5** if plugging the
-  ST-LINK USB in makes the board lose power.
+- Keep jumper **JP5 in**. Without it the chip can be fed through its signal
+  pins, which heats it.
+- The 5V pin must really get 5 V: with 3 V on it the chip ran at 3.02 V.
+- Power up: 5 V first, then the ST-LINK USB. Power down: ST-LINK USB first.
 
 ## 2. ST-LINK (SWD programming and debugging)
 
@@ -72,7 +74,7 @@ no power.
 | GND | GND | GND |
 | SIOD (SDA) | PF0 | D68 |
 | SIOC (SCL) | PF1 | D69 |
-| XCLK | PA8 | morpho CN12, "PA8" |
+| NC | **nothing** | PA8 also stays unconnected, see below |
 | PWDN | PD7 | D51 |
 | RESET | PE2 | D31 |
 | PCLK | PA6 | D12 |
@@ -89,10 +91,14 @@ no power.
 
 Modules that label their data pins **D2–D9** map D2→D0 … D9→D7.
 
-**XCLK:** PA8 outputs 16 MHz. If the camera module has its own oscillator
-(a small metal can marked e.g. 24.000), it already drives XCLK – leave the
-XCLK wire off and set `OV5640_DRIVE_XCLK_FROM_MCO1` to 0 in
-`Core/Inc/ov5640_conf.h`, otherwise two outputs fight on that wire.
+A pin printed **PWNN** is PWDN. If SDA and SCL are swapped the camera does
+not answer at all.
+
+**XCLK:** this camera module has its own oscillator and no XCLK pin, so PA8
+is left off and `OV5640_DRIVE_XCLK_FROM_MCO1` is 0 in
+`Core/Inc/ov5640_conf.h`. For a module with an XCLK pin and no oscillator,
+wire XCLK to PA8 and set it to 1 (16 MHz). Never do that on a module with
+its own oscillator: two outputs would fight on that wire.
 
 ## 4. TFT display + touch (TPM408-2.8, 14-pin header, left to right)
 
@@ -126,7 +132,7 @@ not release MISO and would disturb the touch controller.
 | SD_MISO | PB4 | D25 (shared) |
 | SD_CS | **PF15** | **D2** |
 
-Until this is wired, the SD icon shows grey with a red slash.
+The SD icon appears only when a card is found. Photos are not saved yet.
 
 ## 6. Buttons
 
@@ -142,36 +148,41 @@ No resistor needed (internal pull-up). Press = shoot / back to live,
 starts or cancels the self-timer when TIMER is on. **Held while powering
 up = re-run touch calibration.**
 
-**Power** – the slide switch in the 5 V line, see section 1. These mini
-switches are rated about 0.5 A, close to the board's draw; use a larger
-toggle switch if it gets warm.
+**Power** – the slide switch. On an external 5 V supply it sits in the 5 V
+line (section 1); on battery, before the boost module (section 7). Mini
+slide switches are often rated about 0.5 A; use 1.5 A or more on battery.
 
-## 7. Battery gauge (optional)
+## 7. Battery (planned, not yet built)
 
-For a 1-cell Li-ion/LiPo (3.0–4.2 V), powering the board through a 5 V
-boost module (e.g. MT3608) into the slide switch:
+Remove the external 5 V supply's 5V and GND wires first; never connect both.
+
+| From | To |
+|---|---|
+| Battery + / − | TP4056 (with protection) B+ / B− |
+| TP4056 OUT+ | switch, middle pin |
+| Switch, outer pin | MT3608 IN+ |
+| TP4056 OUT− | MT3608 IN− |
+| MT3608 OUT+ | Nucleo 5V (never VIN or 3V3) |
+| MT3608 OUT− | Nucleo GND |
+
+One 3.7 V Li-ion/LiPo cell able to supply 1.5 A. Set the MT3608 to **5.0 V
+before connecting the Nucleo**. Put 470 µF across its output. Switch off
+while charging.
+
+Gauge, taken after the switch:
 
 ```
-Battery + ──[100 kΩ]──┬──[100 kΩ]── GND
-                      ├── PA3 (A0)
-                      └──[100 nF]── GND
+MT3608 IN+ ──[100 kΩ]──┬──[100 kΩ]── GND
+                       ├── PA3 (A0)
+                       └──[100 nF]── GND
 ```
 
 With nothing on PA3 the status bar shows a plug icon instead of a battery.
 
-## 8. Serial log (optional)
+## 8. Serial port
 
-USART3 at **2 Mbaud**, 8N1:
-
-| Adapter | Nucleo |
-|---|---|
-| RXD | PD8 (morpho CN12) |
-| TXD | PD9 (morpho CN12) |
-| GND | GND |
-| VCC / 3.3V / 5V | **nothing** |
-
-A plain CP2102 may not reach 2 Mbaud; a CP2102N does. The firmware works
-without it – live statistics are also readable over SWD.
+Not used any more: the UART log and frame dump were removed from the
+firmware. Statistics (`preview_stats`, `power_raw`) are readable over SWD.
 
 ## 9. Flashing
 
@@ -193,8 +204,8 @@ three crosshairs firmly with a fingernail or stylus.
 1. Supply measures 4.8–5.2 V, correct polarity, on the **5V** pin.
 2. 3V3 to GND measures ~3.3 V with everything running.
 3. Nothing gets hot. The STM32 should only feel warm.
-4. Screen: red → green → blue → gradient → (calibration on first boot) →
-   live camera image with the icon status bar.
+4. Screen: lens animation with a loading bar, touch calibration on first
+   boot, then the live picture.
 5. Green LED LD1 toggles once a second while the preview runs.
 
 ## 11. LED codes

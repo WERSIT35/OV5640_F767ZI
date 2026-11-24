@@ -125,13 +125,14 @@ extern "C" {
  * clocked from it.  A camera that NACKs every I2C address is the classic
  * symptom of a missing XCLK.
  *
- * Many modules carry their own 24 MHz oscillator.  If yours does not, set
- * this to 1 and wire PA8 (MCO1) to the module's XCLK / MCLK pin.
+ * The module in use has its own oscillator and no XCLK pin (verified: it
+ * answers with PA8 undriven), so this is 0.  Only for a module without an
+ * oscillator, set it to 1 and wire PA8 (MCO1) to XCLK / MCLK.  Driving PA8
+ * into a module that has one makes two outputs fight.
  *
  * MCO1 passes HSI straight through at 16 MHz.  That sits inside the
  * OV5640's 6-27 MHz XCLK range, and it scales every PCLK estimate in this
- * file by 16/24 - making them more conservative, not less.  Leaving this
- * enabled is harmless if you never wire PA8 up.
+ * file by 16/24 - making them more conservative, not less.
  *
  * HSI is kept for MCO1 even though SYSCLK now comes from the PLL, because MCO1
  * has no better option: its sources are HSI, LSE, HSE (8 MHz, near the
@@ -139,7 +140,7 @@ extern "C" {
  * prescaler is 43 MHz - far too fast.
  * The PLL also runs from HSI, so XCLK and SYSCLK share one source.
  */
-#define OV5640_DRIVE_XCLK_FROM_MCO1   1
+#define OV5640_DRIVE_XCLK_FROM_MCO1   0
 
 /* -------------------------------------------------------------------------- */
 /* Image quality / diagnostics                                                */
@@ -170,7 +171,8 @@ extern "C" {
  *   0x0078 -> 15x
  *   0x0038 ->  7x (cleanest, needs good lighting)
  */
-#define OV5640_GAIN_CEILING         0x00F8U
+#define OV5640_GAIN_CEILING         0x0078U
+#define OV5640_GAIN_CEILING_NIGHT   0x00F8U
 
 /* -------------------------------------------------------------------------- */
 /* Power-up timing (milliseconds)                                             */

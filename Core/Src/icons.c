@@ -6,6 +6,8 @@
   ******************************************************************************
   */
 
+#pragma GCC optimize ("O2")
+
 #include "icons.h"
 #pragma GCC optimize ("O2")
 

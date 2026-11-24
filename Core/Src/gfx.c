@@ -363,3 +363,65 @@ void Gfx_Grid(uint16_t *fb)
     }
   }
 }
+
+/* -------------------------------------------------------------------------- */
+/* Rounded shapes                                                             */
+/* -------------------------------------------------------------------------- */
+
+void Gfx_Disc(uint16_t *fb, int cx, int cy, int r, uint16_t colour)
+{
+  int x = r;
+
+  for (int y = 0; y <= r; y++)
+  {
+    while (((x * x) + (y * y)) > ((r * r) + r)) { x--; }
+
+    Gfx_Fill(fb, cx - x, cy + y, (2 * x) + 1, 1, colour);
+
+    if (y != 0)
+    {
+      Gfx_Fill(fb, cx - x, cy - y, (2 * x) + 1, 1, colour);
+    }
+  }
+}
+
+/** Corner inset of a rounded rectangle, by distance from its top or bottom. */
+static int gfx_inset(int row, int h)
+{
+  static const int inset[4] = { 4, 2, 1, 1 };
+  int d = (row < (h - 1 - row)) ? row : (h - 1 - row);
+
+  return (d < 4) ? inset[d] : 0;
+}
+
+void Gfx_Panel(uint16_t *fb, int x, int y, int w, int h)
+{
+  for (int r = 0; r < h; r++)
+  {
+    int in = gfx_inset(r, h);
+    int x0 = x + in;
+    int y0 = y + r;
+    int w0 = w - (2 * in);
+    int h0 = 1;
+
+    if (gfx_clip(&x0, &y0, &w0, &h0))
+    {
+      uint16_t *p = &fb[(y0 * GFX_W) + x0];
+
+      for (int i = 0; i < w0; i++)
+      {
+        p[i] = (uint16_t)((p[i] >> 2) & 0x39E7U);
+      }
+    }
+  }
+}
+
+void Gfx_FillRound(uint16_t *fb, int x, int y, int w, int h, uint16_t colour)
+{
+  for (int r = 0; r < h; r++)
+  {
+    int in = gfx_inset(r, h);
+
+    Gfx_Fill(fb, x + in, y + r, w - (2 * in), 1, colour);
+  }
+}

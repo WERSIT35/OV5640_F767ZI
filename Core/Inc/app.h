@@ -1,18 +1,8 @@
 /**
   ******************************************************************************
   * @file    app.h
-  * @brief   Camera application on top of the live preview: touch menu,
-  *          status bar, picture controls, shooting aids, freeze/review.
-  *
-  * Called from the main loop only while the LCD is idle, because the touch
-  * controller shares SPI1 with it:
-  *
-  *     App_Poll();                        // touch, buttons, timers
-  *     if (App_WantsFrame()) {
-  *         frame = <claimed camera buffer>;
-  *         App_ProcessFrame(frame);       // zoom, peaking, overlays
-  *         Lcd_BlitAsync(frame);
-  *     }
+  * @brief   Camera application: touch UI, picture controls, shooting aids and
+  *          freeze/review on top of the live preview.
   ******************************************************************************
   */
 
@@ -27,30 +17,29 @@ extern "C" {
 #include <stdbool.h>
 #include "icons.h"
 
-/** Reset settings to defaults and push them to the sensor. */
+/** Load the saved settings and start the battery gauge. */
 void App_Init(void);
 
-/** Touch, shutter button, self-timer.  LCD must be idle. */
+/** Send every picture setting to the sensor (after a sensor restart too). */
+void App_ApplySettings(void);
+
+/** Poll buttons, touch, battery and card. Call while the LCD bus is free. */
 void App_Poll(void);
 
-/** False while a frozen frame is being reviewed. */
+/** False while the screen should keep what it shows (flash or review). */
 bool App_WantsFrame(void);
 
-/** Apply the image tools and draw the UI into a claimed frame. */
+/** Draw the tools and interface onto a 320x240 RGB565 frame. */
 void App_ProcessFrame(uint16_t *frame);
 
-/** Frame rates for the status bar, updated once a second. */
-void App_SetFps(uint32_t camera_fps, uint32_t display_fps);
-
-/** True once if the user asked for touch recalibration from the menu. */
-bool App_TakeCalibrationRequest(void);
-
-/**
-  * @brief  Full-screen fault picture: a large icon struck through in red,
-  *         e.g. ICON_CAMERA when the sensor does not answer.  Blocking.
-  * @note   Shown alongside, not instead of, the LED blink codes.
-  */
+/** Full-screen fault: a large struck-out icon. Blocking. */
 void App_ShowFault(Icon_t icon);
+
+/** Latest display rate, for the optional counter. */
+void App_SetFps(uint32_t display_fps);
+
+/** True once after the user asked for a touch calibration. */
+bool App_TakeCalibrationRequest(void);
 
 #ifdef __cplusplus
 }

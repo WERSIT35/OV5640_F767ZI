@@ -130,6 +130,22 @@ HAL_StatusTypeDef OV5640_SetExposureComp(int8_t step);
 /** Night mode: lets AEC stretch frame time (lower fps) in low light. */
 HAL_StatusTypeDef OV5640_SetNightMode(bool enable);
 
+typedef enum
+{
+  OV5640_STYLE_STANDARD = 0,
+  OV5640_STYLE_VIVID,
+  OV5640_STYLE_NATURAL,
+  OV5640_STYLE_COUNT
+} OV5640_Style_t;
+
+/** Colour saturation and sharpening preset. */
+HAL_StatusTypeDef OV5640_SetStyle(OV5640_Style_t style);
+
+#define OV5640_ZOOM_COUNT  3U
+
+/** Sensor-crop zoom: 0 = 1x, 1 = 2x, 2 = 4x. Real detail, not doubled pixels. */
+HAL_StatusTypeDef OV5640_SetZoom(uint8_t level);
+
 #ifdef __cplusplus
 }
 #endif

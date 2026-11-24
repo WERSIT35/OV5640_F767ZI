@@ -26,9 +26,7 @@
 #include "touch.h"
 #include "app.h"
 #include "ov5640.h"
-#include <stdio.h>
-#include <stdarg.h>
-#include <string.h>
+#include "splash.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -62,11 +60,7 @@ UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
 
-/*
- * Live-preview statistics, refreshed once per second.  Also printed on the
- * UART, but kept in RAM so they can be read over SWD (STM32CubeProgrammer
- * or a debugger watch) with no serial link at all.
- */
+/* Live-preview statistics, refreshed once per second, readable over SWD. */
 typedef struct
 {
   uint32_t camera_fps;        /* complete frames from the DCMI, per second  */
@@ -74,21 +68,10 @@ typedef struct
   uint32_t overruns;          /* DCMI FIFO overruns since reset             */
   uint32_t short_frames;      /* frames that ended early                    */
   uint32_t dropped;           /* frames lost because the LCD was still busy */
-  uint32_t fill_fps_x10;      /* full-screen fill rate at boot, x10         */
-  uint32_t spi_hz;            /* LCD SPI clock                              */
+  uint32_t restarts;          /* sensor restarts after a stall              */
 } Preview_Stats_t;
 
 volatile Preview_Stats_t preview_stats;
-
-/*
- * PCLK tuning hook.  Write a sensor PLL system divider (1..15) here over SWD
- * - e.g. STM32_Programmer_CLI -c port=SWD mode=HOTPLUG -w32 <addr> 4 - and
- * the main loop applies it to register 0x3035 between frames, so frame rate
- * against overruns can be explored without reflashing.  0 = no request.
- * The value that wins goes into OV5640_PLL_SYSDIV in ov5640_conf.h.
- */
-volatile uint32_t pclk_sysdiv_request;
-volatile uint32_t pclk_sysdiv_active = OV5640_PLL_SYSDIV;
 
 /* USER CODE END PV */
 
@@ -107,33 +90,12 @@ static void MX_SPI1_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/* ==========================================================================
- * Bring-up diagnostics - remove once the UART is confirmed working.
- *
- * LD1 (PB0) and LD3 (PB14) are the only two Nucleo LEDs still free here;
- * LD2 is on PB7, which this project uses for DCMI_VSYNC.
- *
- * During start-up the markers latch, so a hang is readable long afterwards:
- *   both dark        -> not executing at all
- *   red x10, repeat  -> HSE never came up (no 8 MHz MCO from the ST-LINK)
- *   green on         -> clock/SysTick/GPIO fine, stuck in an MX_*_Init
- *   green + red on   -> all init done, but the USART never asserted TC
- *   green off, red on-> UART transmitted; stuck in Camera_Init
- *
- * Both markers are cleared once the capture loop starts, so a steady red
- * during normal running means something is wrong rather than nothing.
- *
- * After that the two LEDs have distinct jobs:
- *   green toggling   -> live preview running (heartbeat, once a second)
- *   red blink codes  -> failure, flash count = Camera_Status_t value
- *   both alternating -> Error_Handler (an unexpected HAL failure)
- * ========================================================================== */
-
-/* The I2C bus check, address scan and control-pin sweep add roughly three
- * seconds to every boot. Set to 0 once the camera is up. */
-#define CAMERA_DIAG_VERBOSE   1
-
-static void Diag_LedInit(void)
+/*
+ * LEDs: LD1 green (PB0) toggles once a second while the preview runs.
+ * LD3 red (PB14) blinks a Camera_Status_t code if the camera cannot start.
+ * Both alternate in Error_Handler.  LD2 is on PB7, used for DCMI_VSYNC.
+ */
+static void Led_Init(void)
 {
   GPIO_InitTypeDef led = {0};
 
@@ -146,21 +108,7 @@ static void Diag_LedInit(void)
   HAL_GPIO_Init(GPIOB, &led);
 }
 
-static void Diag_Blink(uint32_t times, uint32_t ms)
-{
-  for (uint32_t i = 0U; i < times; i++)
-  {
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
-    HAL_Delay(ms);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
-    HAL_Delay(ms);
-  }
-}
-
-/**
-  * @brief  Flash the red LED `code` times, then hold dark for a beat.
-  * @note   Green is forced off first so the count is unambiguous.
-  */
+/** Flash the red LED `code` times, then hold dark for a beat. */
 static void Diag_BlinkCode(uint32_t code)
 {
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0,  GPIO_PIN_RESET);
@@ -178,13 +126,7 @@ static void Diag_BlinkCode(uint32_t code)
   HAL_Delay(700U);
 }
 
-/**
-  * @brief  Busy-wait roughly `ms` milliseconds without SysTick.
-  * @note   For fault paths only, where interrupts are off and HAL_Delay would
-  *         hang.  Scaled by SystemCoreClock so the blink rate is the same at
-  *         16 MHz (HSE failed, still on HSI) and at 216 MHz.  The ~8 cycles
-  *         per iteration is approximate; it only has to be readable by eye.
-  */
+/** Busy-wait without SysTick, for fault paths with interrupts off. */
 static void Diag_SpinMs(uint32_t ms)
 {
   uint32_t n = (SystemCoreClock / 8000U) * ms;
@@ -192,196 +134,47 @@ static void Diag_SpinMs(uint32_t ms)
   for (volatile uint32_t i = 0U; i < n; i++) { }
 }
 
-/** Repeat a blink code forever. Never returns. */
-static void Diag_BlinkCodeForever(uint32_t code)
+/** Start the sensor, showing a fault and retrying until it answers. */
+static void Camera_Bringup(void)
 {
-  for (;;)
+  for (uint32_t tries = 0U; ; tries++)
   {
-    Diag_BlinkCode(code);
-  }
-}
+    Camera_Status_t status;
 
-/**
-  * @brief  Push a string straight into USART3's data register.
-  * @note   No HAL, no newlib, no interrupts - if this produces nothing but
-  *         the LEDs blink, the fault is in the UART peripheral, the board's
-  *         VCP wiring, or the terminal, not in the application code.
-  */
-static bool Diag_Puts(const char *s)
-{
-  uint32_t guard;
-
-  while (*s != '\0')
-  {
-    guard = 2000000U;
-    while ((USART3->ISR & USART_ISR_TXE) == 0U)
+    /* A fresh I2C peripheral clears a bus state left by a half transfer. */
+    if (tries > 0U)
     {
-      if (--guard == 0U) { return false; }
+      (void)HAL_I2C_DeInit(&hi2c2);
+      MX_I2C2_Init();
     }
 
-    USART3->TDR = (uint8_t)*s++;
-  }
+    Lcd_WaitIdle();
+    status = Camera_Init();
 
-  guard = 2000000U;
-  while ((USART3->ISR & USART_ISR_TC) == 0U)
-  {
-    if (--guard == 0U) { return false; }
-  }
-
-  return true;
-}
-
-/** Small blocking printf-alike onto USART3, for status messages only. */
-static void Log(const char *fmt, ...)
-{
-  char    buf[128];
-  va_list args;
-  int     len;
-
-  va_start(args, fmt);
-  len = vsnprintf(buf, sizeof(buf), fmt, args);
-  va_end(args);
-
-  if (len > 0)
-  {
-    if ((size_t)len > sizeof(buf) - 1U)
+    if (status == CAMERA_OK)
     {
-      len = (int)sizeof(buf) - 1;
+      return;
     }
 
-    HAL_UART_Transmit(&huart3, (uint8_t *)buf, (uint16_t)len, 500U);
-  }
-}
-
-#if CAMERA_DIAG_VERBOSE
-
-/**
-  * @brief  Report the idle levels of SDA/SCL, with and without the MCU's
-  *         internal pull-ups.
-  * @note   An I2C bus at rest must sit HIGH on both lines.  Reading LOW with
-  *         no internal pull-up means either nothing is pulling the bus up
-  *         (no resistors on the module) or something is holding it down
-  *         (unpowered slave, short, stuck transaction).  Leaves the pins
-  *         configured for the I2C peripheral with internal pull-ups on.
-  */
-static void Diag_I2cBusCheck(void)
-{
-  GPIO_InitTypeDef pin = {0};
-
-  __HAL_RCC_GPIOF_CLK_ENABLE();
-
-  pin.Pin   = GPIO_PIN_0 | GPIO_PIN_1;
-  pin.Mode  = GPIO_MODE_INPUT;
-  pin.Pull  = GPIO_NOPULL;
-  pin.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOF, &pin);
-  HAL_Delay(2U);
-
-  Log("I2C idle, floating:  SDA=%d SCL=%d\r\n",
-      (int)HAL_GPIO_ReadPin(GPIOF, GPIO_PIN_0),
-      (int)HAL_GPIO_ReadPin(GPIOF, GPIO_PIN_1));
-
-  pin.Pull = GPIO_PULLUP;
-  HAL_GPIO_Init(GPIOF, &pin);
-  HAL_Delay(2U);
-
-  Log("I2C idle, pulled up: SDA=%d SCL=%d\r\n",
-      (int)HAL_GPIO_ReadPin(GPIOF, GPIO_PIN_0),
-      (int)HAL_GPIO_ReadPin(GPIOF, GPIO_PIN_1));
-
-  /* Hand the pins back to I2C2, keeping the internal pull-ups engaged as a
-   * fallback in case the module has no resistors of its own. They are weak
-   * (~40k) but usually enough at 100 kHz over short wiring. */
-  pin.Mode      = GPIO_MODE_AF_OD;
-  pin.Pull      = GPIO_PULLUP;
-  pin.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
-  pin.Alternate = GPIO_AF4_I2C2;
-  HAL_GPIO_Init(GPIOF, &pin);
-
-  /* Taking the pins away from the peripheral and giving them back can leave
-   * the I2C state machine believing a transfer is in flight (BUSY latched),
-   * which later surfaces as HAL_I2C_ERROR_TIMEOUT instead of a clean NACK.
-   * Toggling PE resets the state machine. */
-  __HAL_I2C_DISABLE(&hi2c2);
-  HAL_Delay(2U);
-  __HAL_I2C_ENABLE(&hi2c2);
-}
-
-/** Dump the I2C peripheral state so a stuck bus is visible directly. */
-static void Diag_I2cRegs(const char *when)
-{
-  Log("I2C %s: CR1=%08lX ISR=%08lX (BUSY=%lu) err=%08lX\r\n",
-      when,
-      (unsigned long)I2C2->CR1,
-      (unsigned long)I2C2->ISR,
-      (unsigned long)((I2C2->ISR >> 15) & 1UL),
-      (unsigned long)hi2c2.ErrorCode);
-}
-
-/**
-  * @brief  Try the chip-ID read under all four PWDN/RESET pin combinations.
-  * @note   Resolves the PE2/PD7 mapping empirically instead of trusting the
-  *         assumption baked into ov5640_conf.h.  If the two are swapped, the
-  *         normal power-up sequence leaves the sensor held in reset AND
-  *         powered down at once, which looks exactly like a dead sensor.
-  */
-static void Diag_CameraPinSweep(void)
-{
-  Log("Control-pin sweep:\r\n");
-
-  for (int e = 0; e <= 1; e++)
-  {
-    for (int d = 0; d <= 1; d++)
+    if (tries >= 2U)
     {
-      uint16_t          id = 0U;
-      HAL_StatusTypeDef st;
-
-      HAL_GPIO_WritePin(GPIOE, GPIO_PIN_2,
-                        e ? GPIO_PIN_SET : GPIO_PIN_RESET);
-      HAL_GPIO_WritePin(GPIOD, GPIO_PIN_7,
-                        d ? GPIO_PIN_SET : GPIO_PIN_RESET);
-
-      /* Generous settle time: the sensor needs a few ms of XCLK after
-       * reset is released before its SCCB block will answer. */
-      HAL_Delay(100U);
-
-      hi2c2.ErrorCode = HAL_I2C_ERROR_NONE;
-      st = OV5640_ReadChipId(&id);
-
-      Log("  PE2=%d PD7=%d -> %s id=0x%04X err=%08lX\r\n",
-          e, d, (st == HAL_OK) ? "ACK " : "NACK",
-          (unsigned)id, (unsigned long)hi2c2.ErrorCode);
+      App_ShowFault(ICON_CAMERA);
+      Diag_BlinkCode((uint32_t)status);
     }
   }
-
-  hi2c2.ErrorCode = HAL_I2C_ERROR_NONE;
 }
 
-/** Sweep every 7-bit address and report which ones acknowledge. */
-static void Diag_I2cScan(void)
+/** Start the preview, restarting the sensor until frames flow. */
+static void Camera_StartOrRetry(void)
 {
-  uint32_t found = 0U;
-
-  Log("I2C scan:");
-
-  for (uint8_t addr = 0x08U; addr <= 0x77U; addr++)
+  while (Camera_StartLive() != CAMERA_OK)
   {
-    if (HAL_I2C_IsDeviceReady(&hi2c2, (uint16_t)(addr << 1), 2U, 20U) == HAL_OK)
-    {
-      Log(" 0x%02X", (unsigned)addr);
-      found++;
-    }
+    App_ShowFault(ICON_CAMERA);
+    Diag_BlinkCode((uint32_t)CAMERA_ERR_TIMEOUT);
+    Camera_Bringup();
+    App_ApplySettings();
   }
-
-  if (found == 0U)
-  {
-    Log(" nothing responded");
-  }
-
-  Log("\r\n");
 }
-
-#endif /* CAMERA_DIAG_VERBOSE */
 
 /**
   * @brief  Turn on the I- and D-cache, keeping the frame buffers uncached.
@@ -426,142 +219,6 @@ static void Cache_Config(void)
   SCB_EnableDCache();
 }
 
-/**
-  * @brief  Display bring-up: solid red, green, blue, then a gradient, then a
-  *         timed run of full-screen fills to measure the raw SPI frame rate.
-  * @note   Runs once at boot, before live preview, so blocking is fine here.
-  */
-static void Lcd_SelfTest(void)
-{
-  static const uint16_t solid[] = { LCD_RED, LCD_GREEN, LCD_BLUE };
-  uint16_t *pixels = (uint16_t *)Camera_GetFrameBuffer(0U);
-  uint32_t  start;
-  uint32_t  elapsed;
-  const uint32_t fills = 30U;
-
-  for (uint32_t i = 0U; i < 3U; i++)
-  {
-    Lcd_FillAsync(solid[i]);
-    Lcd_WaitIdle();
-    HAL_Delay(400U);
-  }
-
-  /* Red rises left to right, green top to bottom, blue falls left to right:
-   * every channel and both axes are visible at a glance. */
-  for (uint32_t y = 0U; y < LCD_HEIGHT; y++)
-  {
-    for (uint32_t x = 0U; x < LCD_WIDTH; x++)
-    {
-      uint32_t r = (x * 31U) / (LCD_WIDTH - 1U);
-      uint32_t g = (y * 63U) / (LCD_HEIGHT - 1U);
-      uint32_t b = 31U - r;
-
-      pixels[y * LCD_WIDTH + x] = (uint16_t)((r << 11) | (g << 5) | b);
-    }
-  }
-
-  Lcd_BlitAsync(pixels);
-  Lcd_WaitIdle();
-  HAL_Delay(800U);
-
-  start = HAL_GetTick();
-
-  for (uint32_t i = 0U; i < fills; i++)
-  {
-    Lcd_FillAsync((i & 1U) ? LCD_WHITE : LCD_BLACK);
-  }
-
-  Lcd_WaitIdle();
-  elapsed = HAL_GetTick() - start;
-
-  preview_stats.spi_hz       = Lcd_GetSpiHz();
-  preview_stats.fill_fps_x10 = (elapsed > 0U) ? (fills * 10000U) / elapsed : 0U;
-
-  Log("LCD: SPI %lu Hz, full-screen fills %lu.%lu fps\r\n",
-      (unsigned long)preview_stats.spi_hz,
-      (unsigned long)(preview_stats.fill_fps_x10 / 10U),
-      (unsigned long)(preview_stats.fill_fps_x10 % 10U));
-}
-
-static const char *Camera_StatusName(Camera_Status_t status)
-{
-  switch (status)
-  {
-    case CAMERA_OK:            return "OK";
-    case CAMERA_ERR_I2C:       return "I2C (no ACK from the sensor)";
-    case CAMERA_ERR_CHIP_ID:   return "CHIP_ID (answered, but not 0x5640)";
-    case CAMERA_ERR_CONFIG:    return "CONFIG (register write failed)";
-    case CAMERA_ERR_DMA:       return "DMA";
-    case CAMERA_ERR_TIMEOUT:   return "TIMEOUT (no end-of-frame)";
-    case CAMERA_ERR_OVERRUN:   return "OVERRUN (PIXCLK too fast for HCLK)";
-    case CAMERA_ERR_SYNC:      return "SYNC";
-    case CAMERA_ERR_PARTIAL:   return "PARTIAL (armed mid-frame)";
-    default:                   return "?";
-  }
-}
-
-/**
-  * @brief  UART debug mode: take one snapshot and dump it in the framed
-  *         format Tools/recv_frame.py and Tools/live_view.py expect.
-  * @note   Live preview must be stopped first; the snapshot lands in frame
-  *         buffer 0 and is also shown on the LCD.  Frames go out only when
-  *         the host asks with 'c', so the port stays readable text the rest
-  *         of the time instead of a binary stream to dig the log out of.
-  */
-static void Debug_SnapshotToUart(void)
-{
-  Camera_Status_t status;
-
-  Log("capture...\r\n");
-
-  status = Camera_Capture(3000U);
-
-  Log("  -> %s after %lu attempt(s), %lu/%lu words left\r\n",
-      Camera_StatusName(status),
-      (unsigned long)Camera_GetLastAttempts(),
-      (unsigned long)Camera_GetTimeoutRemainingWords(),
-      (unsigned long)Camera_GetExpectedWords());
-
-  if (status == CAMERA_OK)
-  {
-    if (Camera_LastFrameHadOverrun())
-    {
-      Log("frame ok but overran (%lu total) - may show a tear; "
-          "raise OV5640_PLL_SYSDIV\r\n",
-          (unsigned long)Camera_GetOverrunCount());
-    }
-
-    Lcd_BlitAsync((const uint16_t *)Camera_GetBuffer());
-    Camera_DumpFrameUart(&huart3);
-    Lcd_WaitIdle();
-  }
-  else
-  {
-    uint32_t cr, sr, risr, misr, frames, vsyncs;
-
-    Log("capture failed: %s (overruns %lu, DMA %lu/%lu words left)\r\n",
-        Camera_StatusName(status),
-        (unsigned long)Camera_GetOverrunCount(),
-        (unsigned long)Camera_GetTimeoutRemainingWords(),
-        (unsigned long)Camera_GetExpectedWords());
-
-    Camera_GetDebugRegs(&cr, &sr, &risr, &misr, &frames, &vsyncs);
-    Log("  DCMI CR=%08lX SR=%08lX RISR=%08lX MISR=%08lX\r\n",
-        (unsigned long)cr, (unsigned long)sr,
-        (unsigned long)risr, (unsigned long)misr);
-    Log("  IRQ counts: frame=%lu vsync=%lu, attempts=%lu\r\n",
-        (unsigned long)frames, (unsigned long)vsyncs,
-        (unsigned long)Camera_GetLastAttempts());
-
-    /* One red pulse per failure. The full blink code is reserved for
-     * Camera_Init, where there is no working UART to fall back on - here
-     * the log line above says far more, far faster. */
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
-    HAL_Delay(60U);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
-  }
-}
-
 /* USER CODE END 0 */
 
 /**
@@ -591,10 +248,7 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-  /* Marker 1: clock, SysTick and GPIO are alive. Green latches on. */
-  Diag_LedInit();
-  Diag_Blink(3U, 150U);
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
+  Led_Init();
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -604,100 +258,28 @@ int main(void)
   MX_USART3_UART_Init();
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
-  /* Marker 2: every MX_*_Init returned. Red latches on. */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
-
-  /* Raw first, so a failure here rules newlib out as the cause. */
-  {
-    bool uart_ok = Diag_Puts("\r\nRAW UART OK\r\n");
-
-    /* Marker 3: green goes OUT once the UART has actually shifted those
-     * bytes out (TC set).  Green staying ON means TXE/TC never asserted,
-     * i.e. the USART itself is dead rather than the link to the PC. */
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0,
-                      uart_ok ? GPIO_PIN_RESET : GPIO_PIN_SET);
-  }
-
-  Log("\r\n=== OV5640 / DCMI capture ===\r\n");
-  Log("SYSCLK %lu Hz, PCLK1 %lu Hz, PCLK2 %lu Hz, USART3 %lu baud\r\n",
-      (unsigned long)HAL_RCC_GetSysClockFreq(),
-      (unsigned long)HAL_RCC_GetPCLK1Freq(),
-      (unsigned long)HAL_RCC_GetPCLK2Freq(),
-      (unsigned long)huart3.Init.BaudRate);
-  Log("HCLK %lu Hz -> max DCMI PIXCLK ~%lu Hz\r\n",
-      (unsigned long)HAL_RCC_GetHCLKFreq(),
-      (unsigned long)((HAL_RCC_GetHCLKFreq() * 2UL) / 5UL));
-
-#if CAMERA_DIAG_VERBOSE
-  Diag_I2cRegs("before   ");
-  Diag_I2cBusCheck();
-  Diag_I2cRegs("after PE ");
-
-  /* Clear accumulated errors so each stage's code is attributable - HAL ORs
-   * into ErrorCode and never clears it by itself. */
-  hi2c2.ErrorCode = HAL_I2C_ERROR_NONE;
-  Diag_I2cScan();
-  Diag_I2cRegs("after scan");
-  hi2c2.ErrorCode = HAL_I2C_ERROR_NONE;
-
-  /* Get XCLK running before probing: without it the sensor cannot answer
-   * SCCB at all, and the pin sweep below would be meaningless. */
-  Camera_EnableXclk();
-  Diag_CameraPinSweep();
-#endif
-
-  /* Display first, so a camera fault can be shown on it as well as blinked. */
+  /* The screen comes up first so the rest of the loading is visible. */
   Lcd_Init();
-  Lcd_SelfTest();
+  Splash_Intro();
 
-  {
-    Camera_Status_t status = Camera_Init();
+  Splash_Step("STARTING CAMERA", 30);
+  Camera_Bringup();
 
-    if (status != CAMERA_OK)
-    {
-      Log("Camera_Init failed: %s (chip ID read back as 0x%04X)\r\n",
-          Camera_StatusName(status), (unsigned)OV5640_GetLastChipId());
-      Log("I2C ErrorCode 0x%08lX\r\n", (unsigned long)hi2c2.ErrorCode);
-
-      /* Blink the failure out rather than halting silently: the enum value
-       * is the flash count. See Camera_Status_t in camera.h. */
-      App_ShowFault(ICON_CAMERA);
-      Diag_BlinkCodeForever((uint32_t)status);
-    }
-  }
-
-  Log("OV5640 ready: %ux%u RGB565, %lu bytes/frame\r\n",
-      (unsigned)OV5640_FRAME_WIDTH, (unsigned)OV5640_FRAME_HEIGHT,
-      (unsigned long)Camera_GetBufferSize());
-  Log("send 'c' to receive one frame\r\n");
+  Splash_Step("LOADING SETTINGS", 70);
+  App_Init();
 
   /* Calibrate on first boot (nothing saved yet), or when the shutter button
    * (PF14) is held while the board starts. */
   if (!Touch_Init() ||
       (HAL_GPIO_ReadPin(SHUTTER_GPIO_Port, SHUTTER_Pin) == GPIO_PIN_RESET))
   {
-    Log("touch: calibrating - tap the three crosshairs\r\n");
     Touch_Calibrate();
   }
 
-  App_Init();
+  Splash_Step("READY", 100);
+  HAL_Delay(250U);
 
-  {
-    Camera_Status_t status = Camera_StartLive();
-
-    if (status != CAMERA_OK)
-    {
-      Log("Camera_StartLive failed: %s\r\n", Camera_StatusName(status));
-      App_ShowFault(ICON_CAMERA);
-      Diag_BlinkCodeForever((uint32_t)status);
-    }
-  }
-
-  Log("live preview running\r\n");
-
-  /* Bring-up is over, so drop the init marker.  From here the LEDs report
-   * running state: green toggles once a second, red means trouble. */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
+  Camera_StartOrRetry();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -708,58 +290,14 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     /*
-     * Live preview.  Nothing here blocks: each pass checks the UART for a
-     * debug request, hands the newest camera frame to the LCD if the LCD is
-     * free, and once a second publishes frame-rate statistics.
+     * Live preview.  Each pass hands the newest camera frame to the LCD if
+     * the LCD is free, and once a second publishes frame-rate statistics.
      */
     static bool     lcd_holds_frame = false;
     static uint32_t stats_start     = 0U;
     static uint32_t camera_base     = 0U;
     static uint32_t display_base    = 0U;
-
-    /* Debug path: 'c' on the UART stops the preview, takes a snapshot,
-     * dumps it for Tools/live_view.py / recv_frame.py, and resumes. */
-    if ((USART3->ISR & USART_ISR_ORE) != 0U)
-    {
-      USART3->ICR = USART_ICR_ORECF;
-    }
-
-    if ((USART3->ISR & USART_ISR_RXNE) != 0U)
-    {
-      uint8_t cmd = (uint8_t)USART3->RDR;
-
-      if ((cmd == 'c') || (cmd == 'C'))
-      {
-        Lcd_WaitIdle();
-        Camera_LiveRelease();
-        lcd_holds_frame = false;
-
-        Camera_StopLive();
-        Debug_SnapshotToUart();
-
-        if (Camera_StartLive() != CAMERA_OK)
-        {
-          Log("live preview failed to restart\r\n");
-        }
-
-        camera_base = Camera_GetLiveFrameCount();
-      }
-    }
-
-    if ((pclk_sysdiv_request >= 1U) && (pclk_sysdiv_request <= 15U) &&
-        (pclk_sysdiv_request != pclk_sysdiv_active))
-    {
-      uint32_t sysdiv = pclk_sysdiv_request;
-
-      if (OV5640_WriteReg(0x3035U,   /* SC_PLL_CTRL1: [7:4] sysdiv */
-                          (uint8_t)((sysdiv << 4) | 0x01U)) == HAL_OK)
-      {
-        pclk_sysdiv_active = sysdiv;
-        Log("sensor sysdiv -> %lu\r\n", (unsigned long)sysdiv);
-      }
-
-      pclk_sysdiv_request = 0U;
-    }
+    static uint32_t stalled         = 0U;
 
     if (!Lcd_IsBusy())
     {
@@ -779,8 +317,9 @@ int main(void)
       {
         Camera_StopLive();
         Touch_Calibrate();
-        (void)Camera_StartLive();
+        Camera_StartOrRetry();
         camera_base = Camera_GetLiveFrameCount();
+        stats_start = HAL_GetTick();
       }
 
       /* App_Poll may have started the shutter flash, which owns the LCD. */
@@ -812,22 +351,30 @@ int main(void)
       preview_stats.short_frames = Camera_GetLiveShortCount();
       preview_stats.dropped      = Camera_GetLiveDroppedCount();
 
-      App_SetFps(preview_stats.camera_fps, preview_stats.display_fps);
+      App_SetFps(preview_stats.display_fps);
 
-      Log("camera %lu fps, display %lu fps, overruns %lu, short %lu, "
-          "dropped %lu\r\n",
-          (unsigned long)preview_stats.camera_fps,
-          (unsigned long)preview_stats.display_fps,
-          (unsigned long)preview_stats.overruns,
-          (unsigned long)preview_stats.short_frames,
-          (unsigned long)preview_stats.dropped);
+      /* A sensor that stops sending (brown-out, loose wire) is restarted. */
+      stalled = (camera == camera_base) ? (stalled + 1U) : 0U;
 
       camera_base  = camera;
       display_base = display;
       stats_start  = now_ms;
 
-      /* Heartbeat: green toggles once a second while preview runs. */
       HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0);
+
+      if (stalled >= 3U)
+      {
+        stalled = 0U;
+        preview_stats.restarts++;
+        Lcd_WaitIdle();
+        Camera_StopLive();
+        lcd_holds_frame = false;
+        Camera_Bringup();
+        App_ApplySettings();
+        Camera_StartOrRetry();
+        camera_base = Camera_GetLiveFrameCount();
+        stats_start = HAL_GetTick();
+      }
     }
   }
   /* USER CODE END 3 */
@@ -1193,10 +740,10 @@ void Error_Handler(void)
   /* USER CODE BEGIN Error_Handler_Debug */
   __disable_irq();
 
-  /* SystemClock_Config runs before Diag_LedInit, so a clock failure lands
+  /* SystemClock_Config runs before Led_Init, so a clock failure lands
    * here with the LED pins still unconfigured.  Initialising them again is
    * harmless if they already are. */
-  Diag_LedInit();
+  Led_Init();
 
   /* HSE bypass relies on the ST-LINK's 8 MHz MCO.  If it was requested but
    * never arrived, say so specifically rather than with the generic pattern

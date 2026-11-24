@@ -1,49 +1,62 @@
-# Project status – checkpoint 2026-11-03
+# Project status – checkpoint 2026-11-24
 
-## Firmware: done and on `main`
+The camera was rewired from scratch and works. The STM32 stays cool.
+
+## Measured on hardware
+
+| Check | Result |
+|---|---|
+| Camera / display | 27–28 fps, 0 overruns, 0 short and 0 dropped frames in normal running |
+| Chip supply (VDDA) | 3.30–3.31 V |
+| Die temperature | 36–38 °C (about 87 °C on the old wiring) |
+| Camera ID | 0x5640 at I2C address 0x3C |
+| Touch | calibrated and working |
+| Night mode | about 9 fps, by design |
+
+The longest continuous run checked over SWD was a few minutes; a 15-minute
+run is still to be done.
+
+## Firmware
 
 | Area | State |
 |---|---|
-| Clocks | HSI → PLL 216 MHz, overdrive, I/D-cache on (HSE bypass unavailable: no ST-LINK MCO) |
-| Camera | OV5640 QVGA RGB565, DCMI continuous + ping-pong buffers, ~28 fps at sysdiv 2, 0 overruns |
-| Display | ILI9341 over SPI1 at 54 MHz with DMA, 43.9 fps full-screen fill |
-| Touch | XPT2046, 3-point calibration saved in flash sector 11 |
-| UI | Icon status bar and menu: effects, WB, EV, night, orientation, grid, histogram, zebra, peaking, 2x zoom, shutter + review, self-timer, draw mode |
-| Status icons | Battery % (PA3 divider), SD presence (CS on PF15), overheat, external power |
-| Fault display | Struck-out camera icon + LED blink code if the sensor fails |
+| Start-up | Lens animation and loading bar; hardware self-tests removed |
+| Picture | Standard / Vivid / Natural styles, 50 Hz anti-flicker, lower gain ceiling, lens colour shading tuned on this lens |
+| Zoom | 1x / 2x / 4x by sensor crop |
+| Interface | Status bar, round shutter, three-tab menu, tap the picture to hide controls |
+| Settings | Saved to flash sector 10 three seconds after a change |
+| Robustness | Camera start-up retries, and a restart if frames stop for 3 s |
+| Shutter | Freezes the picture for review. **Photos are not saved yet** |
+| SD card | Presence icon only |
 
-Last measured on hardware: camera 27–28 fps, display 27–28 fps, no
-overruns or drops, touch working, calibration stored.
+Checked from frames read out of RAM: main screen, System tab, 1x/2x/4x,
+Vivid and night. Not yet confirmed by hand: the intro, every touch button,
+settings surviving a power cycle, and whether the picture is the right way
+up (Menu > Tools > Rotate).
 
-## Hardware: open issue
+## Faults found while rewiring
 
-**The STM32 runs very hot when the camera/display/ST-LINK are wired up.**
+| Symptom | Cause |
+|---|---|
+| VDDA 3.02 V | 3 V had been connected to the 5V input |
+| SDA and SCL stuck low | Camera supply connection; fixed after rework and cleaning |
+| Camera did not answer (NACK) | SDA and SCL swapped |
+| White screen | Display SCK unplugged |
 
-What is known:
+The cause of the earlier overheating was **not proven**. Candidates are the
+power mistakes above and PA8 having been driven while the camera module has
+its own clock. Keep PA8 and the camera's NC pin unconnected.
 
-- The chip reported its own supply as ~2.7 V (expected 3.3 V) and its die
-  as ~87 °C – consistent with current being forced into it.
-- **Erased chip, nothing connected, JP5 in: stays cool.** So the STM32 is
-  not shorted internally and the firmware is not the cause.
-- JP5 was in place throughout, so it is not the cause either.
-- The chip is currently **fully erased** (flash and calibration sector
-  blank).
+## Autofocus
+
+No working focus motor was found: sweeping the sensor's VCM output over its
+full range changed sharpness no more than holding it still, and no separate
+driver chip answered on I2C. A motor with no supply cannot be ruled out.
 
 ## Next steps
 
-1. Reconnect one part at a time, chip still erased, power on 2–3 s each
-   and feel the STM32. Stop at the first step that heats it:
-   1. ST-LINK (5 SWD wires, see WIRING.md §2)
-   2. Display – VCC/GND/LED, then signals
-   3. Camera without XCLK
-   4. Camera XCLK (PA8) alone – if this one, the module has its own
-      oscillator: leave XCLK off and set `OV5640_DRIVE_XCLK_FROM_MCO1` to 0
-   5. Shutter button
-2. Fix the wire or module that brings the heat back.
-3. With everything connected and cool, reflash:
-   `STM32_Programmer_CLI -c port=SWD mode=UR -w Debug/OV5640_F767ZI.elf -v -rst`
-   (rebuild in STM32CubeIDE first if `Debug/` is missing – it is not
-   committed).
-4. Check the chip stays cool while the firmware runs, then re-run the
-   touch calibration (it was erased).
-5. Measure 3V3 under load; it should be ~3.3 V.
+1. 15-minute run, then re-check voltage, temperature and errors.
+2. Battery: TP4056 + MT3608 at 5.0 V (WIRING.md section 1 and 7).
+3. SD card wiring (section 5), then saving photos.
+4. Ideas: gallery, higher-resolution JPEG photos, auto sleep, backlight
+   dimming, video.

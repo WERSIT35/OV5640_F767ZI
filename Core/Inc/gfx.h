@@ -34,6 +34,15 @@ void Gfx_Frame(uint16_t *fb, int x, int y, int w, int h, uint16_t colour);
 /** Halve the brightness of a rectangle - a cheap translucent backdrop. */
 void Gfx_Darken(uint16_t *fb, int x, int y, int w, int h);
 
+/** Filled disc. */
+void Gfx_Disc(uint16_t *fb, int cx, int cy, int r, uint16_t colour);
+
+/** Rounded panel: the picture darkened to a quarter, for text on top. */
+void Gfx_Panel(uint16_t *fb, int x, int y, int w, int h);
+
+/** Filled rectangle with rounded corners. */
+void Gfx_FillRound(uint16_t *fb, int x, int y, int w, int h, uint16_t colour);
+
 /**
   * @brief  Draw text with the built-in 5x7 font (6x8 cell per character at
   *         scale 1).  Lower case is drawn as upper case; unknown characters
