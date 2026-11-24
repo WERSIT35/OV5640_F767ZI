@@ -19,6 +19,7 @@
 #include "lcd.h"
 #include "main.h"
 #include "ov5640.h"
+#include "photo.h"
 #include "power.h"
 #include "sd.h"
 #include "settings.h"
@@ -49,6 +50,8 @@
 #define BTN_W            58
 #define BTN_H            32
 #define MENU_X           6
+#define GAL_X            72
+#define GAL_W            48
 #define ZOOM_X           (GFX_W - 6 - BTN_W)
 #define SHUT_CX          (GFX_W / 2)
 #define SHUT_CY          219
@@ -117,8 +120,10 @@ static bool          freeze_shown;      /* ...and it is already on screen */
 static uint32_t      flash_until;       /* white flash after the shutter  */
 static uint32_t      timer_deadline;    /* self-timer running if non-zero */
 static bool          cal_request;
+static bool          gallery_request;
+static char          saved_text[40];    /* result of the last save        */
+static bool          saved_ok;
 static uint32_t      fps_display;
-static uint32_t      shots;
 
 static char          toast[24];
 static uint32_t      toast_until;
@@ -203,7 +208,6 @@ static void tile_rect(int i, int *x, int *y)
 static void app_shoot(void)
 {
   /* Flash first, then freeze on the next frame and hold it for review. */
-  shots++;
   frozen       = true;
   freeze_shown = false;
   flash_until  = HAL_GetTick() + FLASH_MS;
@@ -327,11 +331,16 @@ static void app_tap(int x, int y)
     {
       menu_open = !menu_open;
     }
+    else if (x < (GAL_X + GAL_W + 6))
+    {
+      gallery_request = true;
+      menu_open       = false;
+    }
     else if (x >= (ZOOM_X - 10))
     {
       app_zoom();
     }
-    else if (in_rect(x, y, SHUT_CX - 30, BAR_Y, 60, GFX_H - BAR_Y))
+    else if (in_rect(x, y, SHUT_CX - 34, BAR_Y, 68, GFX_H - BAR_Y))
     {
       app_shutter();
     }
@@ -575,6 +584,16 @@ static void draw_bar(uint16_t *fb)
   Icon_Draw(fb, MENU_X + ((BTN_W - 16) / 2), BTN_Y + 8,
             menu_open ? ICON_CLOSE : ICON_MENU, LCD_WHITE, 1);
 
+  /* Gallery: a little picture with a sun and a hill. */
+  Gfx_Panel(fb, GAL_X, BTN_Y, GAL_W, BTN_H);
+  Gfx_Frame(fb, GAL_X + 13, BTN_Y + 8, 22, 16, LCD_WHITE);
+  Gfx_Disc(fb, GAL_X + 19, BTN_Y + 13, 2, COLOUR_ACCENT);
+  for (int i = 0; i < 7; i++)
+  {
+    Gfx_Fill(fb, GAL_X + 27 - i, BTN_Y + 16 + i, (2 * i) + 1 - ((i > 6) ? 1 : 0),
+             1, LCD_WHITE);
+  }
+
   Gfx_Panel(fb, ZOOM_X, BTN_Y, BTN_W, BTN_H);
   text_centred(fb, ZOOM_X, BTN_W, BTN_Y + 9, zoom_names[app.zoom],
                (app.zoom != 0U) ? COLOUR_ACCENT : LCD_WHITE, 2);
@@ -740,15 +759,25 @@ void App_ProcessFrame(uint16_t *frame)
 
   if (frozen)
   {
-    char count[16];
+    char name[16];
+    const char *error;
+    int  w;
 
-    /* Review: the clean picture with a small caption. */
+    /* Save the clean picture before anything is drawn over it.  The LCD is
+     * idle here and this buffer is held, so nothing else touches either. */
+    error    = Photo_Save(frame, name);
+    saved_ok = (error == NULL);
+    (void)snprintf(saved_text, sizeof(saved_text), "%s%s",
+                   saved_ok ? "SAVED " : "NOT SAVED: ", saved_ok ? name : error);
+
     Gfx_Frame(frame, 0, 0, GFX_W, GFX_H, LCD_WHITE);
     Gfx_Frame(frame, 1, 1, GFX_W - 2, GFX_H - 2, LCD_WHITE);
-    Gfx_Panel(frame, 8, 8, 76, 24);
-    Icon_Draw(frame, 14, 12, ICON_CAMERA, LCD_WHITE, 1);
-    (void)snprintf(count, sizeof(count), "%lu", (unsigned long)shots);
-    (void)Gfx_Text(frame, 38, 17, count, COLOUR_ACCENT, 1);
+    w = Gfx_TextWidth(saved_text, 1);
+    Gfx_Panel(frame, 8, 8, w + 42, 24);
+    Icon_Draw(frame, 14, 12, saved_ok ? ICON_SD : ICON_CLOSE,
+              saved_ok ? LCD_WHITE : LCD_RED, 1);
+    (void)Gfx_Text(frame, 38, 17, saved_text,
+                   saved_ok ? COLOUR_ON : COLOUR_ACCENT, 1);
     Gfx_Panel(frame, 90, 212, 140, 20);
     text_centred(frame, 90, 140, 218, "TAP TO CONTINUE", LCD_WHITE, 1);
     freeze_shown = true;
@@ -824,6 +853,15 @@ bool App_TakeCalibrationRequest(void)
   bool request = cal_request;
 
   cal_request = false;
+
+  return request;
+}
+
+bool App_TakeGalleryRequest(void)
+{
+  bool request = gallery_request;
+
+  gallery_request = false;
 
   return request;
 }

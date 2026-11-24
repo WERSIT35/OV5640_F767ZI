@@ -132,7 +132,15 @@ not release MISO and would disturb the touch controller.
 | SD_MISO | PB4 | D25 (shared) |
 | SD_CS | **PF15** | **D2** |
 
-The SD icon appears only when a card is found. Photos are not saved yet.
+The pads are four separate holes on the edge opposite the 14-pin header.
+`CS` (PD14) selects the screen and `T_CS` (PF13) the touch chip; neither is
+SD_CS. Join SD_SCK, SD_MOSI and SD_MISO to the SCK, SDI and T_DO pins (not
+SDO) on the display itself, and run one new wire from SD_CS to PF15.
+
+With the board on and no card in, SD_CS reads about 3.3 V. A card that stays
+silent usually means SD_CS is open or MOSI and MISO are swapped.
+
+The SD icon appears only when a card answers.
 
 ## 6. Buttons
 

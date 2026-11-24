@@ -41,6 +41,9 @@ void App_SetFps(uint32_t display_fps);
 /** True once after the user asked for a touch calibration. */
 bool App_TakeCalibrationRequest(void);
 
+/** True once after the user opened the gallery. */
+bool App_TakeGalleryRequest(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -27,6 +27,7 @@
 #include "app.h"
 #include "ov5640.h"
 #include "splash.h"
+#include "gallery.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -313,10 +314,15 @@ int main(void)
        * talk to the touch controller. */
       App_Poll();
 
-      if (App_TakeCalibrationRequest())
+      bool calibrate = App_TakeCalibrationRequest();
+      bool gallery   = App_TakeGalleryRequest();
+
+      if (calibrate || gallery)
       {
         Camera_StopLive();
-        Touch_Calibrate();
+
+        if (calibrate) { Touch_Calibrate(); } else { Gallery_Run(); }
+
         Camera_StartOrRetry();
         camera_base = Camera_GetLiveFrameCount();
         stats_start = HAL_GetTick();

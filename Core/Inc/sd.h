@@ -1,14 +1,12 @@
 /**
   ******************************************************************************
   * @file    sd.h
-  * @brief   SD card presence check on the TFT module's slot, sharing SPI1.
+  * @brief   SD card in SPI mode on the bus shared with the LCD and touch.
   *
-  * Wiring: SD_SCK -> PB3, SD_MOSI -> PB5, SD_MISO -> PB4, SD_CS -> PF15
-  * (Arduino D2).  The slot has no card-detect switch brought out, so the
-  * card is detected by asking it: a GO_IDLE_STATE (CMD0) that comes back
-  * with R1 = 0x01 means a card is there and talking.
-  *
-  * Like the touch controller, call only while the LCD is idle.
+  * Every command and data block carries a CRC that is checked at the far end,
+  * so a bad wire gives an error instead of bad data.  Writing is refused
+  * unless Sd_AllowWrite(true) is in force, and never touches the partition
+  * table or the volume's boot sector.
   ******************************************************************************
   */
 
@@ -19,13 +17,20 @@
 extern "C" {
 #endif
 
+#include <stdint.h>
 #include <stdbool.h>
 
-/** Probe at most every 2 s; cheap to call every loop. LCD must be idle. */
+/** Detect insertion and removal, at most every 2 s. LCD must be idle. */
 void Sd_Poll(void);
 
-/** Result of the last probe. */
+/** True while an initialised card is answering. */
 bool Sd_IsPresent(void);
+
+/** Open or close the write gate. */
+void Sd_AllowWrite(bool allow);
+
+/** Never write this sector (the volume's boot sector). */
+void Sd_Protect(uint32_t sector);
 
 #ifdef __cplusplus
 }

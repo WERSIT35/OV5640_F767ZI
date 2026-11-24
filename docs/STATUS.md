@@ -1,4 +1,4 @@
-# Project status – checkpoint 2026-11-24
+# Project status – checkpoint 2026-11-25
 
 The camera was rewired from scratch and works. The STM32 stays cool.
 
@@ -26,8 +26,9 @@ run is still to be done.
 | Interface | Status bar, round shutter, three-tab menu, tap the picture to hide controls |
 | Settings | Saved to flash sector 10 three seconds after a change |
 | Robustness | Camera start-up retries, and a restart if frames stop for 3 s |
-| Shutter | Freezes the picture for review. **Photos are not saved yet** |
-| SD card | Presence icon only |
+| Shutter | Freezes the picture for review; shows NOT SAVED while saving is off |
+| SD card | Reads FAT and exFAT, CRC-checked; long names. **Saving is written but off** |
+| Gallery | Lists JPG and BMP, shows baseline JPEG (hardware decoder) and 24/32-bit BMP, honours Exif rotation, uses a camera's embedded preview |
 
 Checked from frames read out of RAM: main screen, System tab, 1x/2x/4x,
 Vivid and night. Not yet confirmed by hand: the intro, every touch button,
@@ -42,6 +43,7 @@ up (Menu > Tools > Rotate).
 | SDA and SCL stuck low | Camera supply connection; fixed after rework and cleaning |
 | Camera did not answer (NACK) | SDA and SCL swapped |
 | White screen | Display SCK unplugged |
+| SD card silent | SD_CS not connected, then MOSI and MISO swapped |
 
 The cause of the earlier overheating was **not proven**. Candidates are the
 power mistakes above and PA8 having been driven while the camera module has
@@ -53,10 +55,31 @@ No working focus motor was found: sweeping the sensor's VCM output over its
 full range changed sharpness no more than holding it still, and no separate
 driver chip answered on I2C. A motor with no supply cannot be ruled out.
 
+## SD card, measured 2026-11-25
+
+| Check | Result |
+|---|---|
+| Card | 119 GB exFAT from a Sony camera, 1190 files, 560 JPG listed |
+| Reading | over 300,000 blocks at 13.5 MHz, 0 CRC errors, 0 retries |
+| 24 MP JPEG | about 1 s through the preview, 16 s decoded in full |
+| Card contents | unchanged: names, sizes, dates, first and last 4 KB of every file |
+| Blocks written | 0 |
+
+`PHOTO_SAVE_ENABLED` in `Core/Inc/photo.h` is **0**. The write path has never
+run on hardware. Test it only on a spare or backed-up card: saving one photo
+changes the file system that every other file depends on. Saving creates new
+files only (`OV5640/IMG_nnnn.BMP`), reads each one back, and refuses to write
+the partition table or boot sector; there is no delete or format code.
+
+The gallery's touch buttons have not been confirmed by hand. RAW files,
+videos and progressive JPEGs are not shown.
+
 ## Next steps
 
 1. 15-minute run, then re-check voltage, temperature and errors.
 2. Battery: TP4056 + MT3608 at 5.0 V (WIRING.md section 1 and 7).
-3. SD card wiring (section 5), then saving photos.
-4. Ideas: gallery, higher-resolution JPEG photos, auto sleep, backlight
+3. Photo saving: test on a spare or backed-up card, then set
+   `PHOTO_SAVE_ENABLED` to 1. Saving inside the STM32's flash is an
+   alternative that never writes to the card.
+4. Ideas: higher-resolution JPEG photos, auto sleep, backlight
    dimming, video.
